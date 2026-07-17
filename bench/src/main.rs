@@ -15,6 +15,7 @@ fn print_help() {
           --threads <u32>   Sender threads (default: CPU cores)\n  \
           --duration <u32>  Duration in seconds to run benchmark (default: 10)\n  \
           --metrics <u32>   Number of unique metrics to simulate (default: 1000)\n  \
+          --batch <u32>     Number of metrics to batch per UDP packet (default: 20)\n  \
           --help, -h        Print this help menu\n"
     );
 }
@@ -32,6 +33,7 @@ fn main() {
     let mut threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let mut duration_secs = 10u32;
     let mut unique_metrics = 1000u32;
+    let mut batch_size = 20u32;
 
     // Parse simple command-line arguments
     let mut i = 1;
@@ -57,12 +59,18 @@ fn main() {
                 unique_metrics = args[i + 1].parse().expect("Invalid metrics count");
                 i += 2;
             }
+            "--batch" if i + 1 < args.len() => {
+                batch_size = args[i + 1].parse().expect("Invalid batch size");
+                i += 2;
+            }
             arg => {
                 println!("Unknown argument: {}. Use --help for usage details.", arg);
                 std::process::exit(1);
             }
         }
     }
+
+    assert!(batch_size > 0, "Batch size must be greater than 0");
 
     let target_addr = format!("{}:{}", host, port);
     println!("==================================================");
@@ -71,20 +79,31 @@ fn main() {
     println!("Sender Threads : {}", threads);
     println!("Run Duration   : {} seconds", duration_secs);
     println!("Unique Metrics : {}", unique_metrics);
+    println!("Batch Size     : {} metrics/packet", batch_size);
     println!("==================================================");
 
-    // Pre-allocate metric packet payloads in memory to avoid allocations in the hot path
+    // Pre-allocate metric batch payloads in memory to avoid allocations in the hot path
     println!("Pre-allocating metric payloads...");
-    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(unique_metrics as usize);
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    let mut current_batch = String::new();
+    let mut current_batch_size = 0u32;
+
     for idx in 0..unique_metrics {
-        let payload_str = format!("bench.metric.{} 1\n", idx);
-        payloads.push(payload_str.into_bytes());
+        current_batch.push_str(&format!("bench.metric.{} 1\n", idx));
+        current_batch_size += 1;
+
+        if current_batch_size >= batch_size || idx + 1 == unique_metrics {
+            payloads.push(current_batch.into_bytes());
+            current_batch = String::new();
+            current_batch_size = 0;
+        }
     }
     let payloads = Arc::new(payloads);
 
     // Atomic states shared across sender threads
     let running = Arc::new(AtomicBool::new(true));
     let packets_sent = Arc::new(AtomicU64::new(0));
+    let metrics_sent = Arc::new(AtomicU64::new(0));
     let bytes_sent = Arc::new(AtomicU64::new(0));
 
     let start_time = Instant::now();
@@ -94,6 +113,7 @@ fn main() {
     for thread_id in 0..threads {
         let running_clone = running.clone();
         let packets_clone = packets_sent.clone();
+        let metrics_clone = metrics_sent.clone();
         let bytes_clone = bytes_sent.clone();
         let payloads_clone = payloads.clone();
         let target = target_addr.clone();
@@ -103,32 +123,39 @@ fn main() {
             let socket = UdpSocket::bind("0.0.0.0:0")
                 .expect("Failed to bind thread UDP socket");
             
-            let mut local_sent = 0u64;
+            let mut local_packets = 0u64;
+            let mut local_metrics = 0u64;
             let mut local_bytes = 0u64;
-            let mut metric_idx = thread_id as usize;
+            let mut batch_idx = thread_id as usize;
 
             while running_clone.load(Ordering::Relaxed) {
-                let payload = &payloads_clone[metric_idx % payloads_clone.len()];
+                let payload = &payloads_clone[batch_idx % payloads_clone.len()];
                 
                 // Blast UDP packet
                 if let Ok(bytes) = socket.send_to(payload, &target) {
-                    local_sent += 1;
+                    local_packets += 1;
+                    // Count number of newlines to determine actual metrics sent in this batch
+                    let metrics_in_batch = payload.iter().filter(|&&b| b == b'\n').count() as u64;
+                    local_metrics += metrics_in_batch;
                     local_bytes += bytes as u64;
                 }
 
-                metric_idx = metric_idx.wrapping_add(threads);
+                batch_idx = batch_idx.wrapping_add(threads);
 
                 // Batch flush atomic updates periodically to minimize atomic contention
-                if local_sent % 1000 == 0 {
-                    packets_clone.fetch_add(local_sent, Ordering::Relaxed);
+                if local_packets % 1000 == 0 {
+                    packets_clone.fetch_add(local_packets, Ordering::Relaxed);
+                    metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
                     bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
-                    local_sent = 0;
+                    local_packets = 0;
+                    local_metrics = 0;
                     local_bytes = 0;
                 }
             }
 
             // Flush remaining counts
-            packets_clone.fetch_add(local_sent, Ordering::Relaxed);
+            packets_clone.fetch_add(local_packets, Ordering::Relaxed);
+            metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
             bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
         });
 
@@ -150,17 +177,40 @@ fn main() {
 
     let elapsed = start_time.elapsed();
     let total_packets = packets_sent.load(Ordering::SeqCst);
+    let total_metrics = metrics_sent.load(Ordering::SeqCst);
     let total_bytes = bytes_sent.load(Ordering::SeqCst);
 
     let pps = total_packets as f64 / elapsed.as_secs_f64();
+    let mps = total_metrics as f64 / elapsed.as_secs_f64();
     let mb_sec = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64();
+
+    fn format_number(val: u64) -> String {
+        let s = val.to_string();
+        let mut result = String::new();
+        let mut chars = s.chars().rev().enumerate();
+        while let Some((idx, c)) = chars.next() {
+            if idx > 0 && idx % 3 == 0 {
+                result.push(',');
+            }
+            result.push(c);
+        }
+        result.chars().rev().collect()
+    }
+
+    fn format_float(val: f64) -> String {
+        let int_part = val.trunc() as u64;
+        let frac_part = (val.fract() * 100.0).round().abs() as u64;
+        format!("{}.{:02}", format_number(int_part), frac_part)
+    }
 
     println!("==================================================");
     println!("Benchmark Complete!");
     println!("Elapsed Time   : {:.2?}", elapsed);
-    println!("Total Packets  : {}", total_packets);
+    println!("Total Packets  : {}", format_number(total_packets));
+    println!("Total Metrics  : {}", format_number(total_metrics));
     println!("Total Bytes    : {:.2} MB", total_bytes as f64 / 1_048_576.0);
-    println!("Average PPS    : {:.2} Packets/sec", pps);
+    println!("Average PPS    : {} Packets/sec", format_float(pps));
+    println!("Average MPS    : {} Metrics/sec (Ingested)", format_float(mps));
     println!("Throughput     : {:.2} MB/sec", mb_sec);
     println!("==================================================");
 }

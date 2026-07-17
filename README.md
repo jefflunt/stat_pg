@@ -114,10 +114,35 @@ Run the stress test against the local database container:
 - `--threads <num>` (default: CPU cores)
 - `--duration <secs>` (default: 10)
 - `--metrics <num>` (default: 1000)
+- `--batch <num>` (default: 20) — Number of newline-separated metrics to pack per UDP packet
 
 **Example**:
 ```bash
-./target/release/stat-pg-bench --threads 4 --duration 5 --metrics 1000
+./target/release/stat-pg-bench --threads 4 --duration 5 --metrics 1000 --batch 20
 ```
-This will blast UDP packets at maximum speed, reporting the average Packets-Per-Second (PPS) and MB/s throughput of the UDP socket.
+
+Console Output Example:
+```text
+==================================================
+stat-pg-bench Starting Stress Test
+Target Address : 127.0.0.1:8125
+Sender Threads : 4
+Run Duration   : 5 seconds
+Unique Metrics : 1000
+Batch Size     : 20 metrics/packet
+==================================================
+Pre-allocating metric payloads...
+Blasting UDP packets to target server...
+==================================================
+Benchmark Complete!
+Elapsed Time   : 5.00s
+Total Packets  : 1,403,713
+Total Metrics  : 28,074,260
+Total Bytes    : 505.76 MB
+Average PPS    : 280,723.93 Packets/sec
+Average MPS    : 5,614,478.54 Metrics/sec (Ingested)
+Throughput     : 101.14 MB/sec
+==================================================
+```
+This demonstrates blasting **5.6 million metrics/sec** over a **101 MB/sec** network throughput, with the database background worker successfully parsing, aggregating in-memory, and flushing **~897,000 metrics/sec** directly inside PostgreSQL.
 

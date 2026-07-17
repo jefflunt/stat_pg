@@ -1,46 +1,55 @@
 # Architecture
 
-`stat-pg` is a custom PostgreSQL extension designed to bypass traditional application pipelines and insert triggers to achieve ultra-fast statistical ingestion.
+`stat-pg` is a custom PostgreSQL extension designed to bypass traditional application ingestion pipelines and database triggers to achieve ultra-fast statistical aggregation.
 
-## High-Level Components
+---
+
+## High-Level Threads & Ingestion Flow
 
 ```mermaid
 graph TD
-    Client[Client Systems] -->|UDP: code value timestamp| Socket[UDP Port 8125]
+    Client[Client Systems] -->|UDP Packets| Socket[UDP Port 8125]
     
-    subgraph PostgreSQL Process
-        Socket -->|Receive Loop| BG[Background Worker Thread]
-        BG -->|Parse & Map| Cache[Lock-free In-Memory Map]
+    subgraph PostgreSQL Background Worker Process
+        Socket -->|read| RecvThread["Receiver Thread (OS thread)"]
+        RecvThread -->|parse metrics| Channel[Rust mpsc::channel]
         
-        Cache -->|1s Periodic Flush| Flush[Flush Scheduler]
-        Flush -->|SPI / Direct Write| DB[PostgreSQL Tables]
-        
-        DB -->|Notify channel: real_time_events| Rails[External Rails App via LISTEN/NOTIFY]
+        subgraph Main worker Thread (thread-local context)
+            Channel -->|try_recv| QueueDrain[Queue Drainer]
+            QueueDrain -->|aggregate| Cache[(MetricCache HashMap)]
+            Cache -->|periodic flush| Tx[PG Transaction Context]
+            Tx -->|SPI batch write| DB[(PostgreSQL Tables)]
+        end
     end
 ```
 
-## Detailed Execution Flow
+---
 
-### 1. UDP Listener & Background Worker (BGWorker)
-PostgreSQL supports spawning independent server processes via background workers. During initialization:
-- The background worker binds a socket to a UDP interface and port (defaulting to `0.0.0.0:8125`).
-- The worker executes an event loop that continuously calls `recvfrom` (non-blocking or small timeout to handle interrupts).
+## Detailed Execution Components
 
-### 2. In-Memory Aggregation (Accumulators)
-Instead of inserting every UDP packet to disk, the background worker maintains an in-memory aggregation map.
-- The map key is `(code, resolution_timestamp)`.
-- When a packet `api.requests 1 1721237340` is parsed, the worker calculates the timestamp keys for all resolutions (second, minute, hour, day, 30-day).
-- It increments the counters in memory. This scales to hundreds of thousands of events per second on a single thread.
+### 1. Decoupled Thread Architecture
+PostgreSQL is single-threaded and expects all backend C APIs to run on the main process thread. To avoid thread-local storage corruption, `stat-pg` divides its work:
+* **OS Receiver Thread**: Binds the UDP socket and calls `recv_from`. It is written using only pure Rust standard library APIs (no `pgrx` or `pg_sys` functions). It parses text payloads into structured `Metric` instances and sends them into a thread-safe channel.
+* **Main Backend Thread**: Drains the channel, aggregates metrics into an in-memory accumulator map, checks the flush timer, and connect to Postgres internals.
 
-### 3. SPI Flush Thread
-Every `1.0` seconds (configurable):
-- The worker swaps the active aggregation map with a clean one.
-- In the background, it translates the aggregated counts into batched SQL queries:
-  ```sql
-  INSERT INTO evt_secs (code, at, value) VALUES ($1, $2, $3)
-  ON CONFLICT (at, code) DO UPDATE SET value = evt_secs.value + EXCLUDED.value;
-  ```
-- This flush uses the Server Programming Interface (SPI) to commit these updates safely under a local transaction.
+### 2. In-Memory Aggregation (MetricCache)
+Instead of executing a database write for every incoming packet, metrics are aggregated in-memory:
+* Metrics are summed across five granularity resolutions: second (`evt_secs`), minute (`evt_mins`), hour (`evt_hours`), day (`evt_days`), and 30-day (`evt_30s`).
+* A single metric code sent 100,000 times in a second only results in **1 cache entry update** in memory, reducing write amplification to the database tables.
 
-### 4. Downstream Broadcasting (SSE Support)
-Once the tables are written, the flush routine issues a `NOTIFY real_time_events` statement containing JSON payloads of the updated second-level metrics. Any subscribing clients (like a Rails application or Node daemon) can consume this channel via `LISTEN` and immediately stream updates to user browsers using Server-Sent Events (SSE).
+### 3. Starvation Prevention
+Under peak fires of UDP traffic, the channel can fill up faster than the main thread can aggregate metrics. To prevent the flusher from getting stuck in the queue drainage loop indefinitely, the worker drains a maximum of `100,000` metrics per iteration before yielding to check the timer and run the flush.
+
+### 4. Transaction-Safe SPI Flush
+Every `1.0` seconds (configurable), the worker swaps the metrics cache and initiates a database transaction using:
+```rust
+BackgroundWorker::transaction(|| {
+    Spi::connect_mut(|client| { ... })
+});
+```
+It flushes the aggregates into the tables using high-speed parameterized upserts:
+```sql
+INSERT INTO table (code, at, value) VALUES ($1, $2, $3)
+ON CONFLICT (at, code) DO UPDATE SET value = table.value + EXCLUDED.value;
+```
+This guarantees that all metrics updates are written in transaction-safe batches.

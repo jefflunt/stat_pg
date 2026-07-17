@@ -250,9 +250,15 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     let mut last_flush = SystemTime::now();
 
     while BackgroundWorker::worker_continue() {
-        // 1. Process all metrics currently queued in the channel
-        while let Ok(metric) = rx.try_recv() {
-            cache.add(metric);
+        // 1. Process metrics from the channel (up to 100,000 at a time to prevent flusher starvation)
+        let mut processed = 0;
+        while processed < 100_000 {
+            if let Ok(metric) = rx.try_recv() {
+                cache.add(metric);
+                processed += 1;
+            } else {
+                break;
+            }
         }
 
         // 2. Check if it's time to flush to the tables
