@@ -12,9 +12,21 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust toolchain
+# Grant postgres user write permissions to PostgreSQL extension paths
+RUN chown -R postgres:postgres \
+    /usr/share/postgresql/16/extension \
+    /usr/lib/postgresql/16/lib
+
+# Create and set up development workspace
+WORKDIR /workspace
+RUN chown -R postgres:postgres /workspace
+
+# Switch to standard postgres user
+USER postgres
+
+# Install Rust toolchain for the postgres user
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV PATH="/var/lib/postgresql/.cargo/bin:${PATH}"
 
 # Install cargo-pgrx
 RUN cargo install --locked cargo-pgrx
@@ -22,5 +34,8 @@ RUN cargo install --locked cargo-pgrx
 # Initialize pgrx to point to Postgres 16 system install
 RUN cargo pgrx init --pg16=/usr/lib/postgresql/16/bin/pg_config
 
-# Set up development workspace
-WORKDIR /workspace
+# Copy source files to compile during docker image build
+COPY --chown=postgres:postgres . /workspace
+
+# Pre-compile and install the extension so that it's present in the image
+RUN cargo pgrx install

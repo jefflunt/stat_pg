@@ -28,5 +28,3 @@ log/
 *.so
 *.dylib
 *.dll
-*.control
-sql/

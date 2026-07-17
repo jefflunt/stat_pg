@@ -4,8 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     container_name: stat-pg-db
+    command: ["postgres", "-c", "shared_preload_libraries=stat_pg"]
     environment:
       POSTGRES_PASSWORD: postgres
+      USER: postgres
     ports:
       - "5433:5432"       # Map Postgres server to host 5433 to avoid conflicts
       - "8125:8125/udp"   # Map UDP ingestion port for stats
