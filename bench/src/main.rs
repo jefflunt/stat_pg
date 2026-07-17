@@ -15,7 +15,6 @@ fn print_help() {
           --threads <u32>   Sender threads (default: CPU cores)\n  \
           --duration <u32>  Duration in seconds to run benchmark (default: 10)\n  \
           --metrics <u32>   Number of unique metrics to simulate (default: 1000)\n  \
-          --batch <u32>     Number of metrics to batch per UDP packet (default: 20)\n  \
           --help, -h        Print this help menu\n"
     );
 }
@@ -33,7 +32,6 @@ fn main() {
     let mut threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let mut duration_secs = 10u32;
     let mut unique_metrics = 1000u32;
-    let mut batch_size = 20u32;
 
     // Parse simple command-line arguments
     let mut i = 1;
@@ -59,18 +57,12 @@ fn main() {
                 unique_metrics = args[i + 1].parse().expect("Invalid metrics count");
                 i += 2;
             }
-            "--batch" if i + 1 < args.len() => {
-                batch_size = args[i + 1].parse().expect("Invalid batch size");
-                i += 2;
-            }
             arg => {
                 println!("Unknown argument: {}. Use --help for usage details.", arg);
                 std::process::exit(1);
             }
         }
     }
-
-    assert!(batch_size > 0, "Batch size must be greater than 0");
 
     let target_addr = format!("{}:{}", host, port);
     println!("==================================================");
@@ -79,24 +71,26 @@ fn main() {
     println!("Sender Threads : {}", threads);
     println!("Run Duration   : {} seconds", duration_secs);
     println!("Unique Metrics : {}", unique_metrics);
-    println!("Batch Size     : {} metrics/packet", batch_size);
+    println!("Batching Mode  : MTU-bounded (<1,472 bytes)");
     println!("==================================================");
 
-    // Pre-allocate metric batch payloads in memory to avoid allocations in the hot path
+    // Pre-allocate metric batch payloads in memory to fit strictly under 1,472 bytes
     println!("Pre-allocating metric payloads...");
     let mut payloads: Vec<Vec<u8>> = Vec::new();
     let mut current_batch = String::new();
-    let mut current_batch_size = 0u32;
 
     for idx in 0..unique_metrics {
-        current_batch.push_str(&format!("bench.metric.{} 1\n", idx));
-        current_batch_size += 1;
-
-        if current_batch_size >= batch_size || idx + 1 == unique_metrics {
+        let line = format!("bench.metric.{} 1\n", idx);
+        // If adding this line would exceed the safe UDP MTU payload limit (1,472 bytes),
+        // push the current batch and start a new one.
+        if current_batch.len() + line.len() > 1472 {
             payloads.push(current_batch.into_bytes());
             current_batch = String::new();
-            current_batch_size = 0;
         }
+        current_batch.push_str(&line);
+    }
+    if !current_batch.is_empty() {
+        payloads.push(current_batch.into_bytes());
     }
     let payloads = Arc::new(payloads);
 

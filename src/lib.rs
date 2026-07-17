@@ -3,7 +3,7 @@ use pgrx::prelude::*;
 use pgrx::guc::*;
 use pgrx::spi::SpiClient;
 use pgrx::datum::DatumWithOid;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -120,18 +120,18 @@ pub extern "C-unwind" fn _PG_init() {
 
 #[derive(Clone, Debug, PartialEq)]
 struct Metric {
-    code: String,
+    code: Arc<str>,
     value: f64,
     at: i64,
 }
 
 #[derive(Default)]
 struct MetricCache {
-    secs: HashMap<(String, i64), f64>,
-    mins: HashMap<(String, i64), f64>,
-    hours: HashMap<(String, i64), f64>,
-    days: HashMap<(String, i64), f64>,
-    days30: HashMap<(String, i64), f64>,
+    secs: HashMap<(Arc<str>, i64), f64>,
+    mins: HashMap<(Arc<str>, i64), f64>,
+    hours: HashMap<(Arc<str>, i64), f64>,
+    days: HashMap<(Arc<str>, i64), f64>,
+    days30: HashMap<(Arc<str>, i64), f64>,
 }
 
 impl MetricCache {
@@ -161,9 +161,15 @@ impl MetricCache {
     }
 }
 
-fn parse_packet(payload: &str) -> Option<Metric> {
+fn parse_packet(payload: &str, pool: &mut HashSet<Arc<str>>) -> Option<Metric> {
     let mut parts = payload.split_whitespace();
-    let code = parts.next()?.to_string();
+    let code_str = parts.next()?;
+    
+    // Limit maximum code name length to 64
+    if code_str.len() > 64 {
+        return None;
+    }
+
     let value_str = parts.next()?;
     let value: f64 = value_str.parse().ok()?;
     
@@ -177,6 +183,15 @@ fn parse_packet(payload: &str) -> Option<Metric> {
             .as_secs() as i64
     };
     
+    // String interning logic: reuse existing Arc<str> if present in the local pool
+    let code = if let Some(interned) = pool.get(code_str) {
+        interned.clone()
+    } else {
+        let interned: Arc<str> = Arc::from(code_str);
+        pool.insert(interned.clone());
+        interned
+    };
+
     Some(Metric { code, value, at })
 }
 
@@ -225,12 +240,15 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     // inside this spawned thread to prevent thread-local memory context segfaults.
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        // Initialize thread-local string interning pool to reuse Arc<str> refs
+        let mut intern_pool = HashSet::new();
+
         while running_clone.load(Ordering::Relaxed) {
             match socket.recv_from(&mut buf) {
                 Ok((amt, _src)) => {
                     if let Ok(payload) = std::str::from_utf8(&buf[..amt]) {
                         for line in payload.lines() {
-                            if let Some(metric) = parse_packet(line.trim()) {
+                            if let Some(metric) = parse_packet(line.trim(), &mut intern_pool) {
                                 let _ = tx.send(metric);
                             }
                         }
@@ -303,7 +321,7 @@ fn flush_tables(client: &mut SpiClient<'_>, cache: &MetricCache) -> Result<(), p
 fn flush_table(
     client: &mut SpiClient<'_>,
     table_name: &str,
-    data: &HashMap<(String, i64), f64>,
+    data: &HashMap<(Arc<str>, i64), f64>,
 ) -> Result<(), pgrx::spi::Error> {
     for ((code, at), value) in data {
         let query = format!(
@@ -312,7 +330,7 @@ fn flush_table(
             table_name, table_name
         );
         let args = vec![
-            DatumWithOid::from(code.as_str()),
+            DatumWithOid::from(code.as_ref()),
             DatumWithOid::from(*at),
             DatumWithOid::from(*value),
         ];
@@ -328,28 +346,43 @@ mod unit_tests {
 
     #[test]
     fn test_parse_packet_valid() {
-        let parsed = parse_packet("api.request 5.5 1721237340");
+        let mut pool = HashSet::new();
+        let parsed = parse_packet("api.request 5.5 1721237340", &mut pool);
         assert!(parsed.is_some());
         let m = parsed.unwrap();
-        assert_eq!(m.code, "api.request");
+        assert_eq!(m.code.as_ref(), "api.request");
         assert_eq!(m.value, 5.5);
         assert_eq!(m.at, 1721237340);
     }
 
     #[test]
     fn test_parse_packet_optional_ts() {
-        let parsed = parse_packet("api.request 10");
+        let mut pool = HashSet::new();
+        let parsed = parse_packet("api.request 10", &mut pool);
         assert!(parsed.is_some());
         let m = parsed.unwrap();
-        assert_eq!(m.code, "api.request");
+        assert_eq!(m.code.as_ref(), "api.request");
         assert_eq!(m.value, 10.0);
         assert!(m.at > 0);
     }
 
     #[test]
     fn test_parse_packet_invalid() {
-        assert!(parse_packet("malformed_input").is_none());
-        assert!(parse_packet("api.request abc").is_none());
+        let mut pool = HashSet::new();
+        assert!(parse_packet("malformed_input", &mut pool).is_none());
+        assert!(parse_packet("api.request abc", &mut pool).is_none());
+    }
+
+    #[test]
+    fn test_parse_packet_length_limit() {
+        let mut pool = HashSet::new();
+        // 64-char string is valid
+        let valid_code = "a".repeat(64);
+        assert!(parse_packet(&format!("{} 1", valid_code), &mut pool).is_some());
+
+        // 65-char string is invalid
+        let invalid_code = "a".repeat(65);
+        assert!(parse_packet(&format!("{} 1", invalid_code), &mut pool).is_none());
     }
 }
 
@@ -358,6 +391,7 @@ mod unit_tests {
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
+    use std::sync::Arc;
 
     #[pg_test]
     fn test_table_insertion_and_upsert() {
@@ -365,7 +399,7 @@ mod tests {
             // Verify our tables are created and we can flush into them
             let mut cache = crate::MetricCache::default();
             cache.add(crate::Metric {
-                code: "test_metric".to_string(),
+                code: Arc::from("test_metric"),
                 value: 4.5,
                 at: 1000,
             });
@@ -387,7 +421,7 @@ mod tests {
             // Upsert (conflict update) check
             let mut cache2 = crate::MetricCache::default();
             cache2.add(crate::Metric {
-                code: "test_metric".to_string(),
+                code: Arc::from("test_metric"),
                 value: 5.5,
                 at: 1000,
             });
