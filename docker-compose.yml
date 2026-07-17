@@ -1,0 +1,19 @@
+services:
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: stat-pg-db
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"       # Map Postgres server to host 5433 to avoid conflicts
+      - "8125:8125/udp"   # Map UDP ingestion port for stats
+    volumes:
+      - .:/workspace
+      # Persist cargo registry registry to avoid redownloading crates on rebuilds
+      - cargo-cache:/root/.cargo/registry
+    restart: unless-stopped
+
+volumes:
+  cargo-cache:

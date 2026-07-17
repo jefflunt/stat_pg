@@ -1,0 +1,32 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# OS Specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and Temp
+*.log
+tmp/
+log/
+.sass-cache/
+
+# PostgreSQL / pgrx build outputs (if built locally)
+*.so
+*.dylib
+*.dll
+*.control
+sql/
