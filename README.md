@@ -88,3 +88,36 @@ You can verify the UDP pipeline manually from your host machine (macOS/Linux):
     api.request.count | 28687289 | 12.500000000000
    (1 row)
    ```
+
+---
+
+## Benchmarking
+
+We have included a high-speed, multi-threaded UDP stress test benchmark tool inside `bench/` to check your environment's ingestion limits.
+
+### 1. Compile the Benchmark Tool
+On your host machine, compile the tool in release mode:
+```bash
+cd bench
+cargo build --release
+```
+
+### 2. Run the Benchmark
+Run the stress test against the local database container:
+```bash
+./target/release/stat-pg-bench [options]
+```
+
+**Options**:
+- `--host <ip>` (default: `127.0.0.1`)
+- `--port <port>` (default: `8125`)
+- `--threads <num>` (default: CPU cores)
+- `--duration <secs>` (default: 10)
+- `--metrics <num>` (default: 1000)
+
+**Example**:
+```bash
+./target/release/stat-pg-bench --threads 4 --duration 5 --metrics 1000
+```
+This will blast UDP packets at maximum speed, reporting the average Packets-Per-Second (PPS) and MB/s throughput of the UDP socket.
+
