@@ -36,10 +36,10 @@ To ensure the flusher regularly yields and executes transaction commits, we enfo
 
 ```rust
 // Starvation-resistant implementation
-while metrics_processed < 500_000 {
-    if let Ok((metric_id, value, at)) = metric_rx.try_recv() {
-        sliding_window.add(metric_id as usize, value, at, client)?;
-        metrics_processed += 1;
+while s.metrics_processed < 500_000 {
+    if let Ok((metric_id, value, at)) = s.metric_rx.pop() {
+        s.sliding_window.add(metric_id as usize, value, at, client)?;
+        s.metrics_processed += 1;
     } else {
         break;
     }
@@ -47,11 +47,11 @@ while metrics_processed < 500_000 {
 ```
 
 ### How it Works
-1. **The Drainage Cap**: The loop pulls at most `500,000` items from the channel.
+1. **The Drainage Cap**: The loop pulls at most `500,000` items from the SPSC ring buffer.
 2. **Exiting and Checking**: Once `metrics_processed` reaches `500,000`, the loop terminates. The thread proceeds immediately to the next steps:
     - Checks the flush timer.
     - Flushes aggregated metrics to PostgreSQL tables if `flush_interval` has passed.
     - Yields CPU execution to the operating system using `BackgroundWorker::wait_latch(Some(sleep_dur))` to let PostgreSQL handle internal interrupts and checkpoints.
 3. **Looping**: On the next loop tick, the worker resumes draining the remaining queued channel items.
 
-This threshold balances **high aggregate memory absorption** (so we drain the channel quickly) with **predictable write latency** (guaranteeing that SQL transactions commit on time).
+This threshold balances **high aggregate memory absorption** (so we drain the queue quickly) with **predictable write latency** (guaranteeing that SQL transactions commit on time).

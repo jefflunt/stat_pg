@@ -13,13 +13,13 @@ graph TD
     subgraph PostgreSQL Background Worker Process
         Listener -->|accept| Connection["Client Stream Threads (Concurrent OS threads)"]
         Connection -->|1. RegRequest Handshake| RegChannel[mpsc Reg Channel]
-        Connection -->|2. Stream 0x02 Packets| MetricChannel[mpsc Metric Channel]
+        Connection -->|2. Stream 0x02 Packets| MetricChannel[rtrb SPSC Ring Buffer]
         
         subgraph Main worker Thread (thread-local context)
             RegChannel -->|register| SPI_Reg[SPI Registration Transaction]
             SPI_Reg -->|insert/lookup| Cache[(shared name_to_id cache)]
             
-            MetricChannel -->|try_recv| QueueDrain[Queue Drainer]
+            MetricChannel -->|pop| QueueDrain[Queue Drainer]
             QueueDrain -->|aggregate| SlidingWin[(SlidingWindow Circular Array)]
             SlidingWin -->|periodic flush| Tx[PG Transaction Context]
             Tx -->|SPI parameterized batch write| DB[(PostgreSQL Rollup Tables)]
@@ -33,8 +33,8 @@ graph TD
 
 ### 1. Decoupled Thread Architecture
 PostgreSQL is single-threaded and expects all backend C APIs to run on the main process thread. To avoid thread-local storage corruption and satisfy compile-time UnwindSafe bounds, `stat-pg` divides its work:
-* **Concurrent OS Stream Threads**: Binds a non-blocking TCP listener. For every incoming socket connection, it spawns a dedicated client reader thread. These threads read incoming buffers, execute name registration handshakes, and stream parsed metric updates into a thread-safe channel.
-* **Main Backend Thread**: Drains the channel, processes registration queries, aggregates metric values into the sliding aggregation window, checks the flush timer, and connects to Postgres database internals.
+* **Concurrent OS Stream Threads**: Binds a non-blocking TCP listener. For every incoming socket connection, it spawns a dedicated client reader thread. These threads read incoming buffers, execute name registration handshakes, and write parsed metric updates into a high-performance, lock-free SPSC ring buffer queue (`rtrb`).
+* **Main Backend Thread**: Drains the SPSC consumer, processes registration queries, aggregates metric values into the sliding aggregation window, checks the flush timer, and connects to Postgres database internals.
 
 ### 2. In-Memory Aggregation (SlidingWindow)
 Instead of executing a database write for every incoming packet, metrics are aggregated in-memory:

@@ -17,10 +17,10 @@ PostgreSQL is historically a single-threaded process architecture. It relies hea
 To leverage multi-core concurrency (e.g., to handle high-speed TCP streaming sockets without blocking on database writes), you must decouple network reading from database writing.
 
 ```
-[Spawned Client Threads (OS)]      [mpsc Channels]           [Main Thread (PG)]
+[Spawned Client Threads (OS)]      [SPSC Ring Buffer]        [Main Thread (PG)]
   Read TCP Stream                    reg_tx.send()             reg_rx.try_recv()
   Parse Handshake Handshake     =======================>       SPI name registration
-  Parse 0x02 Updates                 metric_tx.send()          metric_rx.try_recv()
+  Parse 0x02 Updates                 metric_tx.push()          metric_rx.pop()
   (Pure Rust StdLib)            =======================>       SlidingWindow aggregate
                                                                SPI parameterized upserts
 ```
@@ -31,8 +31,9 @@ All spawned threads (both the listener thread and connection stream worker threa
 * **CRITICAL**: Spawned threads must never call `pgrx::log!`, `BackgroundWorker::worker_continue()`, or execute any SPI/FFI functions.
 * **FFI Warning**: Calling `pgrx::log!` from a spawned thread will cause a panic with: `postgres FFI may not be called from multiple threads`. Use standard Rust `println!` or `eprintln!` instead, which safely redirects to stderr/Postgres logs.
 
-### 2. Coordination via channels and atomics
-* Use `std::sync::mpsc::channel` to pass structured metrics and registration requests from the client threads to the main thread.
+### 2. Coordination via queues and atomics
+* Use a high-performance, lock-free SPSC queue (`rtrb`) for metrics to prevent multi-producer atomic write contention.
+* Store the SPSC Producer in a shared `Arc<Mutex<Option<Producer>>>` container. Connection streams take the producer at connection start and return it at connection end, enabling seamless reconnects without hot path locking.
 * Use `Arc<AtomicBool>` to signal the threads when the BGWorker process is terminating, allowing them to cleanly exit their loops.
 
 ### 3. SPI Connection boundaries
@@ -47,3 +48,8 @@ The main thread alone manages connections to Postgres database internals:
       })
   });
   ```
+
+### 4. Unwind Safety in Rust 2021
+* The SPSC consumer (`Consumer`) contains interior mutability (`UnsafeCell`) and is not `UnwindSafe` / `RefUnwindSafe` by default.
+* In the Rust 2021 edition, closures capture individual fields. Passing references to fields of a non-unwind-safe struct causes compiler failures on `BackgroundWorker::transaction(|| ...)` closures.
+* To bypass this, wrap raw worker pointers in a manual `UnwindSafe` / `RefUnwindSafe` newtype (`SafeWorkerStatePtr`) and invoke methods on it directly to force Rust to capture the wrapper itself rather than its inner raw fields.
