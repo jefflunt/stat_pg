@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# We keep this dependency-free to ensure instant compilation on any host machine!
+postgres = "0.19"

@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::env;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use std::thread;
 
 fn print_help() {
@@ -22,40 +21,46 @@ fn print_help() {
 }
 
 fn register_metrics(
-    stream: &mut TcpStream,
+    db_url: &str,
     unique_metrics: u32,
-) -> std::io::Result<HashMap<String, i32>> {
+) -> Result<HashMap<String, i32>, String> {
+    use postgres::{Client, NoTls};
+    let mut client = Client::connect(db_url, NoTls)
+        .map_err(|e| format!("Failed to connect to database: {}", e))?;
+
     let mut name_to_id = HashMap::new();
+
+    let mut transaction = client.transaction()
+        .map_err(|e| format!("Failed to start transaction: {}", e))?;
+    
+    transaction.execute("LOCK TABLE stat_pg_metrics IN EXCLUSIVE MODE;", &[])
+        .map_err(|e| format!("Failed to lock table: {}", e))?;
+
+    let prepared = transaction.prepare(
+        "INSERT INTO stat_pg_metrics (id, name)
+         VALUES (
+             (SELECT COALESCE(MIN(unused.id), 1)
+              FROM (
+                  SELECT 1 AS id
+                  UNION ALL
+                  SELECT id + 1 FROM stat_pg_metrics
+              ) unused
+              WHERE unused.id NOT IN (SELECT id FROM stat_pg_metrics)),
+             $1
+         )
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id;"
+    ).map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     for idx in 0..unique_metrics {
         let name = format!("bench.metric.{}", idx);
-        let name_bytes = name.as_bytes();
-        let name_len = name_bytes.len() as u16;
-
-        // Packet format: [0x01 (1B)] [Length (2B BE)] [Name]
-        let mut req = Vec::with_capacity(3 + name_bytes.len());
-        req.push(0x01);
-        req.extend_from_slice(&name_len.to_be_bytes());
-        req.extend_from_slice(name_bytes);
-
-        stream.write_all(&req)?;
-
-        // Read response: [0x01] [Length (2B)] [Name] [ID (4B LE)]
-        let mut header = [0u8; 3];
-        stream.read_exact(&mut header)?;
-        assert_eq!(header[0], 0x01);
-        let resp_name_len = u16::from_be_bytes([header[1], header[2]]) as usize;
-        
-        let mut body = vec![0u8; resp_name_len + 4];
-        stream.read_exact(&mut body)?;
-        
-        let id_offset = resp_name_len;
-        let id_bytes = &body[id_offset .. id_offset + 4];
-        let assigned_id = i32::from_le_bytes(id_bytes.try_into().unwrap());
-        
-        name_to_id.insert(name, assigned_id);
+        let row = transaction.query_one(&prepared, &[&name])
+            .map_err(|e| format!("Failed to register {}: {}", name, e))?;
+        let id: i32 = row.get(0);
+        name_to_id.insert(name, id);
     }
 
+    transaction.commit().map_err(|e| format!("Failed to commit: {}", e))?;
     Ok(name_to_id)
 }
 
@@ -181,12 +186,12 @@ fn main() {
 
     let target_addr = format!("{}:{}", host, port);
     println!("==================================================");
-    println!("stat-pg-bench Starting Bidirectional TCP Stress Test");
+    println!("stat-pg-bench Starting UDP Stress Test");
     println!("Target Address : {}", target_addr);
     println!("Sender Threads : {}", threads);
     println!("Run Duration   : {} seconds ({:.1} minutes)", duration_secs, duration_secs as f64 / 60.0);
     println!("Unique Metrics : {}", unique_metrics);
-    println!("Protocol Format: Bidirectional TCP (ID Handshake)");
+    println!("Protocol Format: Raw UDP (12-byte packets)");
     println!("==================================================");
 
     // Atomic states shared across sender threads
@@ -243,6 +248,19 @@ fn main() {
         }
     });
 
+    let db_port = if host == "127.0.0.1" || host == "localhost" { 5433 } else { 5432 };
+    let db_url = format!("postgres://postgres:postgres@{}:{}/postgres", host, db_port);
+
+    // Register all simulated metric names in the database and retrieve their IDs
+    let name_to_id = match register_metrics(&db_url, unique_metrics) {
+        Ok(m) => m,
+        Err(e) => {
+            println!("Failed to register metrics in database: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let name_to_id = Arc::new(name_to_id);
+
     let start_time = Instant::now();
     let mut worker_handles = Vec::with_capacity(threads as usize);
 
@@ -253,61 +271,51 @@ fn main() {
         let metrics_clone = metrics_sent.clone();
         let bytes_clone = bytes_sent.clone();
         let target = target_addr.clone();
+        let name_to_id_clone = name_to_id.clone();
 
         let handle = thread::spawn(move || {
-            let mut stream = match TcpStream::connect(&target) {
+            let socket = match UdpSocket::bind("0.0.0.0:0") {
                 Ok(s) => s,
                 Err(e) => {
-                    println!("Thread {} failed to connect to {}: {}", thread_id, target, e);
-                    return;
-                }
-            };
-            
-            // Perform metric name registration handshake
-            let name_to_id = match register_metrics(&mut stream, unique_metrics) {
-                Ok(m) => m,
-                Err(e) => {
-                    println!("Thread {} registration handshake failed: {}", thread_id, e);
+                    println!("Thread {} failed to bind UDP socket: {}", thread_id, e);
                     return;
                 }
             };
 
+            if let Err(e) = socket.connect(&target) {
+                println!("Thread {} failed to connect UDP socket to {}: {}", thread_id, target, e);
+                return;
+            }
+            
             let mut local_packets = 0u64;
             let mut local_metrics = 0u64;
             let mut local_bytes = 0u64;
             
-            // Write buffer for batching Type 0x02 packets (21 bytes each, 100 packets = 2100 bytes)
-            let mut write_buf = Vec::with_capacity(2100);
+            // Batch size: 100 updates * 12 bytes = 1200 bytes
+            let mut write_buf = Vec::with_capacity(1200);
             let mut batch_idx = thread_id as usize;
 
             while running_clone.load(Ordering::Relaxed) {
                 write_buf.clear();
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or(Duration::ZERO)
-                    .as_secs() as i64;
 
                 let mut metrics_in_batch = 0;
                 for _ in 0..100 {
                     let metric_idx = batch_idx % unique_metrics as usize;
                     let metric_name = format!("bench.metric.{}", metric_idx);
-                    let &metric_id = name_to_id.get(&metric_name).unwrap();
+                    let &metric_id = name_to_id_clone.get(&metric_name).unwrap();
 
-                    write_buf.push(0x02);
                     write_buf.extend_from_slice(&metric_id.to_le_bytes());
                     write_buf.extend_from_slice(&1.0f64.to_le_bytes());
-                    write_buf.extend_from_slice(&ts.to_le_bytes());
 
                     batch_idx = batch_idx.wrapping_add(threads as usize);
                     metrics_in_batch += 1;
                 }
 
-                if stream.write_all(&write_buf).is_ok() {
+                if socket.send(&write_buf).is_ok() {
                     local_packets += 1;
                     local_metrics += metrics_in_batch;
                     local_bytes += write_buf.len() as u64;
                 } else {
-                    // TCP write error, socket closed or dropped
                     break;
                 }
 
@@ -324,14 +332,12 @@ fn main() {
             packets_clone.fetch_add(local_packets, Ordering::Relaxed);
             metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
             bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let _ = stream.shutdown(std::net::Shutdown::Both);
         });
 
         worker_handles.push(handle);
     }
 
-    println!("Blasting TCP metric updates to target server...");
+    println!("Blasting UDP metric updates to target server...");
 
     // Wait for the duration of the benchmark (180 seconds)
     thread::sleep(Duration::from_secs(duration_secs as u64));

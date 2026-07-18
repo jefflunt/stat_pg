@@ -4,14 +4,11 @@ use pgrx::guc::*;
 use pgrx::spi::SpiClient;
 use pgrx::datum::DatumWithOid;
 use crate::pg_sys::PgOid;
-use std::collections::HashMap;
 use std::ffi::CString;
-use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use rtrb::RingBuffer;
 use std::thread;
 
 pgrx::pg_module_magic!();
@@ -136,101 +133,7 @@ pub extern "C-unwind" fn _PG_init() {
         .load();
 }
 
-struct RegRequest {
-    name: String,
-    resp: Sender<i32>,
-}
 
-struct Slot {
-    timestamp: i64,
-    data: Vec<f64>,
-}
-
-struct SlidingWindow {
-    window_size: usize,
-    slots: Vec<Slot>,
-    max_timestamp: i64,
-}
-
-impl SlidingWindow {
-    fn new(window_size: usize) -> Self {
-        let mut slots = Vec::with_capacity(window_size);
-        for _ in 0..window_size {
-            slots.push(Slot {
-                timestamp: 0,
-                data: Vec::new(),
-            });
-        }
-        Self {
-            window_size,
-            slots,
-            max_timestamp: 0,
-        }
-    }
-
-    fn add(&mut self, metric_id: usize, value: f64, ts: i64, client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
-        let w = self.window_size;
-
-        if ts > self.max_timestamp {
-            if self.max_timestamp == 0 {
-                self.max_timestamp = ts;
-                for i in 0..w {
-                    self.slots[i].timestamp = ts - (w as i64 - 1) + (i as i64);
-                }
-            } else {
-                for t in (self.max_timestamp + 1)..=ts {
-                    let idx = (t % w as i64) as usize;
-                    if self.slots[idx].timestamp > 0 {
-                        flush_slot(client, self.slots[idx].timestamp, &self.slots[idx].data)?;
-                    }
-                    self.slots[idx].timestamp = t;
-                    self.slots[idx].data.clear();
-                }
-                self.max_timestamp = ts;
-            }
-        }
-
-        let min_ts = self.max_timestamp - w as i64 + 1;
-        if ts >= min_ts && ts <= self.max_timestamp {
-            let idx = (ts % w as i64) as usize;
-            if self.slots[idx].timestamp == ts {
-                if metric_id >= self.slots[idx].data.len() {
-                    self.slots[idx].data.resize(metric_id + 1, 0.0);
-                }
-                self.slots[idx].data[metric_id] += value;
-            }
-        } else {
-            // Packet is older than our window - execute directly to prevent data loss
-            let mut single_data = Vec::new();
-            single_data.resize(metric_id + 1, 0.0);
-            single_data[metric_id] = value;
-            flush_slot(client, ts, &single_data)?;
-        }
-
-        Ok(())
-    }
-
-    fn flush_expired(&mut self, client: &mut SpiClient<'_>, max_age_seconds: i64) -> Result<(), pgrx::spi::Error> {
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
-        
-        let oldest_allowed = now_sec - max_age_seconds;
-
-        for slot in &mut self.slots {
-            if slot.timestamp > 0 && slot.timestamp < oldest_allowed {
-                let has_data = slot.data.iter().any(|&v| v > 0.0);
-                if has_data {
-                    flush_slot(client, slot.timestamp, &slot.data)?;
-                }
-                slot.timestamp = 0;
-                slot.data.clear();
-            }
-        }
-        Ok(())
-    }
-}
 
 fn flush_slot(client: &mut SpiClient<'_>, ts: i64, data: &[f64]) -> Result<(), pgrx::spi::Error> {
     let mut active_entries = Vec::new();
@@ -312,138 +215,7 @@ fn flush_table_slice(
     Ok(())
 }
 
-fn handle_client(
-    mut stream: std::net::TcpStream,
-    shared_cache: Arc<std::sync::RwLock<HashMap<String, i32>>>,
-    reg_tx: Sender<RegRequest>,
-    metric_tx: Arc<Mutex<Option<rtrb::Producer<(i32, f64, i64)>>>>,
-    running: Arc<AtomicBool>,
-) {
-    use std::io::Read;
-    use std::io::Write;
 
-    let mut local_prod = match metric_tx.lock().unwrap().take() {
-        Some(p) => p,
-        None => {
-            eprintln!("stat-pg: SPSC producer already taken!");
-            return;
-        }
-    };
-
-    let mut buf = vec![0u8; 65536];
-    let mut read_buf = Vec::new();
-
-    if let Err(_) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
-        return;
-    }
-
-    while running.load(Ordering::Relaxed) {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                read_buf.extend_from_slice(&buf[..n]);
-                
-                let mut offset = 0;
-                while offset < read_buf.len() {
-                    let msg_type = read_buf[offset];
-                    if msg_type == 0x01 {
-                        if offset + 3 > read_buf.len() {
-                            break;
-                        }
-                        let name_len = u16::from_be_bytes([read_buf[offset + 1], read_buf[offset + 2]]) as usize;
-                        if offset + 3 + name_len > read_buf.len() {
-                            break;
-                        }
-                        
-                        let name_bytes = &read_buf[offset + 3 .. offset + 3 + name_len];
-                        if let Ok(name_str) = std::str::from_utf8(name_bytes) {
-                            let mut id = {
-                                let read_guard = shared_cache.read().unwrap();
-                                read_guard.get(name_str).cloned()
-                            };
-                            
-                            if id.is_none() {
-                                let (tx_resp, rx_resp) = channel();
-                                let req = RegRequest {
-                                    name: name_str.to_string(),
-                                    resp: tx_resp,
-                                };
-                                if reg_tx.send(req).is_ok() {
-                                    id = rx_resp.recv().ok();
-                                }
-                            }
-                            
-                            let final_id = id.unwrap_or(-1);
-                            
-                            let mut resp = Vec::with_capacity(3 + name_len + 4);
-                            resp.push(0x01);
-                            resp.extend_from_slice(&(name_len as u16).to_be_bytes());
-                            resp.extend_from_slice(name_bytes);
-                            resp.extend_from_slice(&final_id.to_le_bytes());
-                            let _ = stream.write_all(&resp);
-                        }
-                        offset += 3 + name_len;
-                    } else if msg_type == 0x02 {
-                        if offset + 21 > read_buf.len() {
-                            break;
-                        }
-                        let id_bytes = &read_buf[offset + 1 .. offset + 5];
-                        let val_bytes = &read_buf[offset + 5 .. offset + 13];
-                        let ts_bytes = &read_buf[offset + 13 .. offset + 21];
-                        
-                        let metric_id = i32::from_le_bytes(id_bytes.try_into().unwrap());
-                        let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
-                        let at = i64::from_le_bytes(ts_bytes.try_into().unwrap());
-                        
-                        let item = (metric_id, value, at);
-                        let mut to_push = item;
-                        while let Err(rtrb::PushError::Full(returned)) = local_prod.push(to_push) {
-                            to_push = returned;
-                            if !running.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            std::thread::yield_now();
-                        }
-                        offset += 21;
-                    } else {
-                        offset += 1;
-                    }
-                }
-                
-                if offset > 0 {
-                    read_buf.drain(..offset);
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Timeout, loop to check running state
-            }
-            Err(_) => break,
-        }
-    }
-
-    *metric_tx.lock().unwrap() = Some(local_prod);
-}
-
-// Wrapper structure for thread worker state captured by the transaction closure
-struct WorkerState {
-    sliding_window: SlidingWindow,
-    last_flush: SystemTime,
-    metrics_processed: i32,
-    spi_err: Option<pgrx::spi::SpiError>,
-    metric_rx: rtrb::Consumer<(i32, f64, i64)>,
-}
-
-struct SafeWorkerStatePtr(*mut WorkerState);
-unsafe impl Send for SafeWorkerStatePtr {}
-unsafe impl Sync for SafeWorkerStatePtr {}
-impl std::panic::UnwindSafe for SafeWorkerStatePtr {}
-impl std::panic::RefUnwindSafe for SafeWorkerStatePtr {}
-
-impl SafeWorkerStatePtr {
-    unsafe fn get_mut(&self) -> &mut WorkerState {
-        &mut *self.0
-    }
-}
 
 #[pg_guard]
 #[no_mangle]
@@ -464,184 +236,148 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
 
     BackgroundWorker::connect_worker_to_spi(Some(&db_name), Some(&db_user));
 
-    // Load existing metrics lookup cache from database
-    let name_to_id_result = BackgroundWorker::transaction(|| {
-        let mut cache = HashMap::new();
+    // Load initial max ID from database to size the initial buffer
+    let max_id_result = BackgroundWorker::transaction(|| {
         Spi::connect_mut(|client| {
             let table_exists: bool = client.select(
                 "SELECT EXISTS (SELECT FROM pg_tables WHERE tablename = 'stat_pg_metrics');",
                 None, &[]
             )?.first().get_one()?.unwrap_or(false);
 
-            if table_exists {
-                let tuples = client.select("SELECT id, name FROM stat_pg_metrics;", None, &[])?;
-                for row in tuples {
-                    let id: i32 = row.get_by_name("id")?.expect("id field");
-                    let name: String = row.get_by_name("name")?.expect("name field");
-                    cache.insert(name, id);
-                }
-            }
-            Ok::<(), pgrx::spi::Error>(())
-        })?;
-        Ok::<HashMap<String, i32>, pgrx::spi::Error>(cache)
+            let id = if table_exists {
+                client.select("SELECT COALESCE(MAX(id), 0) FROM stat_pg_metrics;", None, &[])?
+                    .first()
+                    .get_one::<i32>()?
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            Ok::<i32, pgrx::spi::Error>(id)
+        })
     });
 
-    let name_to_id = match name_to_id_result {
-        Ok(cache) => cache,
-        Err(e) => {
-            log!("stat-pg: failed to load existing metrics cache: {:?}", e);
-            HashMap::new()
-        }
-    };
-    let shared_cache = Arc::new(std::sync::RwLock::new(name_to_id));
+    let max_id = max_id_result.unwrap_or(0);
+    let max_valid_id = Arc::new(AtomicI32::new(max_id));
+    let active_buffer = Arc::new(Mutex::new(vec![0.0; max_id as usize + 1]));
 
     let running = Arc::new(AtomicBool::new(true));
 
-    let (reg_tx, reg_rx) = channel::<RegRequest>();
-    let (prod, metric_rx) = RingBuffer::<(i32, f64, i64)>::new(1048576);
-    let metric_tx = Arc::new(Mutex::new(Some(prod)));
-
-    // Spawn TCP listener thread
-    let shared_cache_clone = shared_cache.clone();
-    let reg_tx_clone = reg_tx.clone();
-    let metric_tx_clone = metric_tx.clone();
+    // Spawn UDP listener thread
     let running_thread = running.clone();
+    let active_buffer_clone = active_buffer.clone();
+    let max_valid_id_clone = max_valid_id.clone();
 
     thread::spawn(move || {
         let socket_addr = format!("{}:{}", bind_addr, port);
-        let listener = match TcpListener::bind(&socket_addr) {
-            Ok(l) => {
-                eprintln!("stat-pg: bound TCP listener to {}", socket_addr);
-                l
+        let socket = match UdpSocket::bind(&socket_addr) {
+            Ok(s) => {
+                eprintln!("stat-pg: bound UDP listener to {}", socket_addr);
+                s
             }
             Err(e) => {
-                eprintln!("stat-pg: failed to bind TCP listener to {}: {}", socket_addr, e);
+                eprintln!("stat-pg: failed to bind UDP listener to {}: {}", socket_addr, e);
                 return;
             }
         };
 
-        if let Err(e) = listener.set_nonblocking(true) {
-            eprintln!("stat-pg: failed to set TCP listener non-blocking: {}", e);
+        if let Err(e) = socket.set_read_timeout(Some(Duration::from_millis(100))) {
+            eprintln!("stat-pg: failed to set UDP read timeout: {}", e);
             return;
         }
 
+        let mut buf = vec![0u8; 65536];
+
         while running_thread.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _addr)) => {
-                    let cache = shared_cache_clone.clone();
-                    let r_tx = reg_tx_clone.clone();
-                    let m_tx = metric_tx_clone.clone();
-                    let run = running_thread.clone();
-                    thread::spawn(move || {
-                        handle_client(stream, cache, r_tx, m_tx, run);
-                    });
+            match socket.recv_from(&mut buf) {
+                Ok((n, _src)) => {
+                    // Parse 12-byte metric updates: [ID (4B LE i32)] [Value (8B LE f64)]
+                    let mut offset = 0;
+                    while offset + 12 <= n {
+                        let id_bytes = &buf[offset..offset + 4];
+                        let val_bytes = &buf[offset + 4..offset + 12];
+                        
+                        let id = i32::from_le_bytes(id_bytes.try_into().unwrap());
+                        let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
+
+                        let max_id = max_valid_id_clone.load(Ordering::Relaxed) as usize;
+                        if id > 0 && (id as usize) <= max_id {
+                            let mut active = active_buffer_clone.lock().unwrap();
+                            if (id as usize) < active.len() {
+                                active[id as usize] += value;
+                            }
+                        }
+                        offset += 12;
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
+                    // Timeout, loop to check running state
                 }
                 Err(_) => {}
             }
         }
     });
 
-    let buffer_window = BUFFER_WINDOW.get() as usize;
-
-    let mut state = WorkerState {
-        sliding_window: SlidingWindow::new(buffer_window),
-        last_flush: SystemTime::now(),
-        metrics_processed: 0,
-        spi_err: None,
-        metric_rx,
-    };
-
-    // Use a raw pointer wrapped in AssertUnwindSafe to safely share state
-    // across the UnwindSafe transaction closures without capturing mut references.
-    let state_ptr = &mut state as *mut WorkerState;
-    let state_safe = SafeWorkerStatePtr(state_ptr);
+    let mut last_flush = SystemTime::now();
+    let mut local_flush_buffer = vec![0.0; max_id as usize + 1];
 
     while BackgroundWorker::worker_continue() {
-        // 1. Process dynamic metric registration requests from clients
-        while let Ok(req) = reg_rx.try_recv() {
-            let id = {
-                let read_guard = shared_cache.read().unwrap();
-                read_guard.get(&req.name).cloned()
-            };
-
-            if let Some(existing_id) = id {
-                let _ = req.resp.send(existing_id);
-            } else {
-                let result = BackgroundWorker::transaction(|| {
-                    Spi::connect_mut(|client| {
-                        let query = "INSERT INTO stat_pg_metrics (name) VALUES ($1) \
-                                     ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name \
-                                     RETURNING id;";
-                        let args = vec![DatumWithOid::from(req.name.as_str())];
-                        let id = client.update(query, None, &args)?
-                            .first()
-                            .get_one::<i32>()?
-                            .expect("Expected OID");
-                        Ok::<i32, pgrx::spi::Error>(id)
-                    })
-                });
-                match result {
-                    Ok(new_id) => {
-                        let mut write_guard = shared_cache.write().unwrap();
-                        write_guard.insert(req.name.clone(), new_id);
-                        let _ = req.resp.send(new_id);
-                    }
-                    Err(e) => {
-                        log!("stat-pg: failed to register metric name: {:?}", e);
-                        let _ = req.resp.send(-1);
-                    }
-                }
+        let now = SystemTime::now();
+        let elapsed = now.duration_since(last_flush).unwrap_or(Duration::ZERO);
+        if elapsed.as_secs_f64() >= flush_sec {
+            let current_max = max_valid_id.load(Ordering::Relaxed) as usize;
+            
+            if local_flush_buffer.len() < current_max + 1 {
+                local_flush_buffer.resize(current_max + 1, 0.0);
             }
-        }
 
-        // 2. Connect to SPI to aggregate incoming metrics and flush
-        let result = BackgroundWorker::transaction(|| {
-            // SAFETY: Single-threaded background worker main loop execution
-            let s = unsafe { state_safe.get_mut() };
-
-            Spi::connect_mut(|client| {
-                s.metrics_processed = 0;
-                while s.metrics_processed < 500_000 {
-                    if let Ok((metric_id, value, at)) = s.metric_rx.pop() {
-                        if let Err(e) = s.sliding_window.add(metric_id as usize, value, at, client) {
-                            s.spi_err = Some(e);
-                            break;
-                        }
-                        s.metrics_processed += 1;
-                    } else {
-                        break;
-                    }
+            {
+                let mut active = active_buffer.lock().unwrap();
+                if active.len() < current_max + 1 {
+                    active.resize(current_max + 1, 0.0);
                 }
+                std::mem::swap(&mut *active, &mut local_flush_buffer);
+            }
 
-                let now = SystemTime::now();
-                let elapsed = now.duration_since(s.last_flush).unwrap_or(Duration::ZERO);
-                if elapsed.as_secs_f64() >= flush_sec {
-                    if let Err(e) = s.sliding_window.flush_expired(client, buffer_window as i64) {
-                        s.spi_err = Some(e);
+            let at = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() as i64;
+
+            let result = BackgroundWorker::transaction(|| {
+                Spi::connect_mut(|client| {
+                    let table_exists: bool = client.select(
+                        "SELECT EXISTS (SELECT FROM pg_tables WHERE tablename = 'stat_pg_metrics');",
+                        None, &[]
+                    )?.first().get_one()?.unwrap_or(false);
+
+                    if !table_exists {
+                        return Ok(());
                     }
-                    s.last_flush = now;
-                }
 
-                Ok::<(), pgrx::spi::Error>(())
-            })
-        });
+                    // 1. Refresh bounds by querying database max ID
+                    let db_max_id: i32 = client.select(
+                        "SELECT COALESCE(MAX(id), 0) FROM stat_pg_metrics;",
+                        None, &[]
+                    )?.first().get_one()?.unwrap_or(0);
 
-        if let Err(e) = result {
-            log!("stat-pg SPI connection transaction error: {:?}", e);
+                    max_valid_id.store(db_max_id, Ordering::Relaxed);
+
+                    // 2. Flush slot data
+                    flush_slot(client, at, &local_flush_buffer)?;
+
+                    Ok::<(), pgrx::spi::Error>(())
+                })
+            });
+
+            if let Err(e) = result {
+                log!("stat-pg SPI transaction error: {:?}", e);
+            }
+
+            // Reset local_flush_buffer to 0.0
+            for val in &mut local_flush_buffer {
+                *val = 0.0;
+            }
+            last_flush = now;
         }
-        if let Some(ref e) = state.spi_err {
-            log!("stat-pg SPI execution error: {:?}", e);
-        }
 
-        let sleep_dur = if state.metrics_processed > 0 {
-            Duration::from_millis(1)
-        } else {
-            Duration::from_millis(50)
-        };
-        BackgroundWorker::wait_latch(Some(sleep_dur));
+        BackgroundWorker::wait_latch(Some(Duration::from_millis(50)));
     }
 
     running.store(false, Ordering::Relaxed);
