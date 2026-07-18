@@ -171,13 +171,12 @@ fn main() {
                 Err(_) => {}
             }
 
-            print!(
-                "\rSQL Monitor Run {:<4} | SUM(value): {:<15} (Query took {:.2?})\x1b[K",
+            println!(
+                "SQL Monitor Run {:<4} | SUM(value): {:<15} (Query took {:.2?})",
                 run,
                 format_number(current_sum as u64),
                 duration
             );
-            std::io::stdout().flush().unwrap();
 
             if current_sum == previous_sum && current_sum > 0.0 {
                 stable_seconds += 1;
