@@ -9,10 +9,10 @@ use std::ffi::CString;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use rtrb::RingBuffer;
 use std::thread;
-use std::panic::AssertUnwindSafe;
 
 pgrx::pg_module_magic!();
 
@@ -316,11 +316,19 @@ fn handle_client(
     mut stream: std::net::TcpStream,
     shared_cache: Arc<std::sync::RwLock<HashMap<String, i32>>>,
     reg_tx: Sender<RegRequest>,
-    metric_tx: crossbeam_channel::Sender<(i32, f64, i64)>,
+    metric_tx: Arc<Mutex<Option<rtrb::Producer<(i32, f64, i64)>>>>,
     running: Arc<AtomicBool>,
 ) {
     use std::io::Read;
     use std::io::Write;
+
+    let mut local_prod = match metric_tx.lock().unwrap().take() {
+        Some(p) => p,
+        None => {
+            eprintln!("stat-pg: SPSC producer already taken!");
+            return;
+        }
+    };
 
     let mut buf = vec![0u8; 65536];
     let mut read_buf = Vec::new();
@@ -387,7 +395,15 @@ fn handle_client(
                         let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
                         let at = i64::from_le_bytes(ts_bytes.try_into().unwrap());
                         
-                        let _ = metric_tx.send((metric_id, value, at));
+                        let item = (metric_id, value, at);
+                        let mut to_push = item;
+                        while let Err(rtrb::PushError::Full(returned)) = local_prod.push(to_push) {
+                            to_push = returned;
+                            if !running.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
                         offset += 21;
                     } else {
                         offset += 1;
@@ -404,6 +420,8 @@ fn handle_client(
             Err(_) => break,
         }
     }
+
+    *metric_tx.lock().unwrap() = Some(local_prod);
 }
 
 // Wrapper structure for thread worker state captured by the transaction closure
@@ -412,6 +430,19 @@ struct WorkerState {
     last_flush: SystemTime,
     metrics_processed: i32,
     spi_err: Option<pgrx::spi::SpiError>,
+    metric_rx: rtrb::Consumer<(i32, f64, i64)>,
+}
+
+struct SafeWorkerStatePtr(*mut WorkerState);
+unsafe impl Send for SafeWorkerStatePtr {}
+unsafe impl Sync for SafeWorkerStatePtr {}
+impl std::panic::UnwindSafe for SafeWorkerStatePtr {}
+impl std::panic::RefUnwindSafe for SafeWorkerStatePtr {}
+
+impl SafeWorkerStatePtr {
+    unsafe fn get_mut(&self) -> &mut WorkerState {
+        &mut *self.0
+    }
 }
 
 #[pg_guard]
@@ -467,7 +498,8 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     let running = Arc::new(AtomicBool::new(true));
 
     let (reg_tx, reg_rx) = channel::<RegRequest>();
-    let (metric_tx, metric_rx) = crossbeam_channel::unbounded::<(i32, f64, i64)>();
+    let (prod, metric_rx) = RingBuffer::<(i32, f64, i64)>::new(1048576);
+    let metric_tx = Arc::new(Mutex::new(Some(prod)));
 
     // Spawn TCP listener thread
     let shared_cache_clone = shared_cache.clone();
@@ -519,12 +551,13 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         last_flush: SystemTime::now(),
         metrics_processed: 0,
         spi_err: None,
+        metric_rx,
     };
 
     // Use a raw pointer wrapped in AssertUnwindSafe to safely share state
     // across the UnwindSafe transaction closures without capturing mut references.
     let state_ptr = &mut state as *mut WorkerState;
-    let state_safe = AssertUnwindSafe(state_ptr);
+    let state_safe = SafeWorkerStatePtr(state_ptr);
 
     while BackgroundWorker::worker_continue() {
         // 1. Process dynamic metric registration requests from clients
@@ -567,12 +600,12 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         // 2. Connect to SPI to aggregate incoming metrics and flush
         let result = BackgroundWorker::transaction(|| {
             // SAFETY: Single-threaded background worker main loop execution
-            let s = unsafe { &mut *state_safe.0 };
+            let s = unsafe { state_safe.get_mut() };
 
             Spi::connect_mut(|client| {
                 s.metrics_processed = 0;
                 while s.metrics_processed < 500_000 {
-                    if let Ok((metric_id, value, at)) = metric_rx.try_recv() {
+                    if let Ok((metric_id, value, at)) = s.metric_rx.pop() {
                         if let Err(e) = s.sliding_window.add(metric_id as usize, value, at, client) {
                             s.spi_err = Some(e);
                             break;
