@@ -140,20 +140,26 @@ impl MetricCache {
         let val = m.value;
         let ts = m.at;
 
-        // seconds
-        self.secs.entry((code.clone(), ts)).and_modify(|e| *e += val).or_insert(val);
-        // minutes
-        let min_ts = ts / 60;
-        self.mins.entry((code.clone(), min_ts)).and_modify(|e| *e += val).or_insert(val);
-        // hours
-        let hr_ts = ts / 3600;
-        self.hours.entry((code.clone(), hr_ts)).and_modify(|e| *e += val).or_insert(val);
-        // days
-        let day_ts = ts / 86400;
-        self.days.entry((code.clone(), day_ts)).and_modify(|e| *e += val).or_insert(val);
-        // 30-days
-        let day30_ts = ts / 2592000;
-        self.days30.entry((code, day30_ts)).and_modify(|e| *e += val).or_insert(val);
+        // In the hot path, we ONLY insert/aggregate into the seconds map.
+        // This cuts down hashing overhead in the parser loop by 80% (1 lookup instead of 5).
+        self.secs.entry((code, ts)).and_modify(|e| *e += val).or_insert(val);
+    }
+
+    fn populate_rollups(&mut self) {
+        for ((code, ts), &val) in &self.secs {
+            // minutes
+            let min_ts = ts / 60;
+            self.mins.entry((code.clone(), min_ts)).and_modify(|e| *e += val).or_insert(val);
+            // hours
+            let hr_ts = ts / 3600;
+            self.hours.entry((code.clone(), hr_ts)).and_modify(|e| *e += val).or_insert(val);
+            // days
+            let day_ts = ts / 86400;
+            self.days.entry((code.clone(), day_ts)).and_modify(|e| *e += val).or_insert(val);
+            // 30-days
+            let day30_ts = ts / 2592000;
+            self.days30.entry((code.clone(), day30_ts)).and_modify(|e| *e += val).or_insert(val);
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -269,9 +275,9 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     let mut intern_pool = HashSet::new();
 
     while BackgroundWorker::worker_continue() {
-        // 1. Process packet payloads from the channel (up to 100,000 metrics per iteration to prevent starvation)
+        // 1. Process packet payloads from the channel (up to 500,000 metrics per iteration to prevent starvation)
         let mut processed_metrics = 0;
-        while processed_metrics < 100_000 {
+        while processed_metrics < 500_000 {
             if let Ok(packet_bytes) = rx.try_recv() {
                 parse_variable_binary(&packet_bytes, &mut intern_pool, &mut cache, &mut processed_metrics);
             } else {
@@ -284,6 +290,7 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         let elapsed = now.duration_since(last_flush).unwrap_or(Duration::ZERO);
         if elapsed.as_secs_f64() >= flush_sec {
             if !cache.is_empty() {
+                cache.populate_rollups(); // Run the rollup aggregation only once per second!
                 let result = BackgroundWorker::transaction(|| {
                     Spi::connect_mut(|client| {
                         if let Err(e) = flush_tables(client, &cache) {
@@ -301,7 +308,13 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         }
 
         // 3. Briefly yield execution to avoid CPU pegging
-        BackgroundWorker::wait_latch(Some(Duration::from_millis(50)));
+        // Adaptive sleep latch: sleep only 1ms under load to maximize throughput, or 50ms when idle
+        let sleep_dur = if processed_metrics > 0 {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(50)
+        };
+        BackgroundWorker::wait_latch(Some(sleep_dur));
     }
 
     // Shut down spawned thread
@@ -318,24 +331,71 @@ fn flush_tables(client: &mut SpiClient<'_>, cache: &MetricCache) -> Result<(), p
     Ok(())
 }
 
+fn make_batch_insert_query(table_name: &str, batch_size: usize) -> String {
+    let mut sql = format!("INSERT INTO {} (code, at, value) VALUES ", table_name);
+    for i in 0..batch_size {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        let base = i * 3;
+        sql.push_str(&format!("(${}, ${}, ${})", base + 1, base + 2, base + 3));
+    }
+    sql.push_str(&format!(
+        " ON CONFLICT (at, code) DO UPDATE SET value = {}.value + EXCLUDED.value;",
+        table_name
+    ));
+    sql
+}
+
 fn flush_table(
     client: &mut SpiClient<'_>,
     table_name: &str,
     data: &HashMap<(Arc<str>, i64), f64>,
 ) -> Result<(), pgrx::spi::Error> {
-    for ((code, at), value) in data {
-        let query = format!(
-            "INSERT INTO {} (code, at, value) VALUES ($1, $2, $3) \
-             ON CONFLICT (at, code) DO UPDATE SET value = {}.value + EXCLUDED.value;",
-            table_name, table_name
-        );
-        let args = vec![
-            DatumWithOid::from(code.as_ref()),
-            DatumWithOid::from(*at),
-            DatumWithOid::from(*value),
-        ];
-        client.update(&query, None, &args)?;
+    if data.is_empty() {
+        return Ok(());
     }
+
+    let entries: Vec<(&(Arc<str>, i64), &f64)> = data.iter().collect();
+    let mut index = 0;
+    let total = entries.len();
+
+    // Target bulk insertion chunk sizes
+    let chunks = [5000, 500, 1];
+
+    for &chunk_size in &chunks {
+        if index >= total {
+            break;
+        }
+
+        // Prepare the statement once for this chunk size if we have enough elements left
+        if index + chunk_size <= total {
+            let sql = make_batch_insert_query(table_name, chunk_size);
+            
+            // Build the argument type list
+            let mut arg_types = Vec::with_capacity(chunk_size * 3);
+            for _ in 0..chunk_size {
+                arg_types.push(PgOid::from(pg_sys::TEXTOID));
+                arg_types.push(PgOid::from(pg_sys::INT8OID));
+                arg_types.push(PgOid::from(pg_sys::FLOAT8OID));
+            }
+
+            let prepared = client.prepare_mut(&sql, &arg_types)?;
+
+            while index + chunk_size <= total {
+                let mut args = Vec::with_capacity(chunk_size * 3);
+                for i in 0..chunk_size {
+                    let ((code, at), value) = entries[index + i];
+                    args.push(DatumWithOid::from(code.as_ref()));
+                    args.push(DatumWithOid::from(*at));
+                    args.push(DatumWithOid::from(*value));
+                }
+                client.update(&prepared, None, &args)?;
+                index += chunk_size;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -385,7 +445,7 @@ mod unit_tests {
 
         parse_variable_binary(&packet, &mut pool, &mut cache, &mut processed);
         assert_eq!(processed, 0);
-        assert!(cache.is_empty());
+        assert!(cache.secs.is_empty());
     }
 }
 
@@ -407,6 +467,7 @@ mod tests {
                 at: 1000,
             });
 
+            cache.populate_rollups();
             crate::flush_tables(client, &cache).expect("Flush tables failed");
 
             // Query check for seconds
@@ -429,6 +490,7 @@ mod tests {
                 at: 1000,
             });
 
+            cache2.populate_rollups();
             crate::flush_tables(client, &cache2).expect("Flush tables failed");
 
             // Query check again (value should be aggregated: 4.5 + 5.5 = 10.0)

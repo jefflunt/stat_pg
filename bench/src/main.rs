@@ -1,6 +1,6 @@
 use std::env;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::thread;
@@ -30,7 +30,7 @@ fn main() {
     let mut host = "127.0.0.1".to_string();
     let mut port = 8125u16;
     let mut threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let mut duration_secs = 180u32; // Changed default to 180 seconds (3 minutes)
+    let mut duration_secs = 180u32;
     let mut unique_metrics = 1000u32;
 
     // Parse simple command-line arguments
@@ -112,15 +112,18 @@ fn main() {
 
     // Atomic states shared across sender threads
     let running = Arc::new(AtomicBool::new(true));
-    let packets_sent = Arc::new(AtomicU64::new(0));
-    let metrics_sent = Arc::new(AtomicU64::new(0));
-    let bytes_sent = Arc::new(AtomicU64::new(0));
+    let packets_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let metrics_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Spawn background SQL monitoring thread
     // Runs query: SELECT SUM(value::float8) FROM evt_secs every 60 seconds
-    // Executes 5 times: 3 times during the run, 2 times after
+    // Loop terminates only when SUM(value) remains unchanged (i.e. all inserts are final)
     let query_thread = thread::spawn(move || {
-        for run in 1..=5 {
+        let mut run = 1;
+        let mut previous_sum = 0.0;
+
+        loop {
             thread::sleep(Duration::from_secs(60));
             
             let start = Instant::now();
@@ -142,12 +145,14 @@ fn main() {
             let duration = start.elapsed();
             
             println!("\n--------------------------------------------------");
-            print!("SQL Monitor Run {}/5 | ", run);
+            print!("SQL Monitor Run {} | ", run);
+            
+            let mut current_sum = 0.0;
             match output {
                 Ok(out) => {
                     if out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
-                        let sum_val: f64 = stdout.trim().parse().unwrap_or(0.0);
+                        current_sum = stdout.trim().parse().unwrap_or(0.0);
                         
                         fn format_number(val: u64) -> String {
                             let s = val.to_string();
@@ -162,7 +167,7 @@ fn main() {
                             result.chars().rev().collect()
                         }
                         
-                        println!("SUM(value): {} (Query took {:.2?})", format_number(sum_val as u64), duration);
+                        println!("SUM(value): {} (Query took {:.2?})", format_number(current_sum as u64), duration);
                     } else {
                         let stderr = String::from_utf8_lossy(&out.stderr);
                         println!("SQL Error: {} (took {:.2?})", stderr.trim(), duration);
@@ -173,6 +178,15 @@ fn main() {
                 }
             }
             println!("--------------------------------------------------");
+
+            // If the sum remains the same as the previous check, all backlogged queue items are processed.
+            if current_sum == previous_sum && current_sum > 0.0 {
+                println!("Database inserts have stabilized at {}. Ingestion queue is fully drained!", current_sum);
+                break;
+            }
+
+            previous_sum = current_sum;
+            run += 1;
         }
     });
 
@@ -278,8 +292,8 @@ fn main() {
     println!("Throughput     : {:.2} MB/sec", mb_sec);
     println!("==================================================");
 
-    // Wait for the SQL background monitoring thread to complete its remaining runs (up to 300 seconds total)
-    println!("Waiting for final background SQL query runs to finish...");
+    // Wait for the SQL background monitoring thread to complete its remaining runs
+    println!("Waiting for final background SQL query runs to finish and stabilize...");
     let _ = query_thread.join();
     println!("==================================================");
 }
