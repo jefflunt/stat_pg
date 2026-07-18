@@ -72,6 +72,68 @@ fn format_number(val: u64) -> String {
     result.chars().rev().collect()
 }
 
+fn run_psql_query(host: &str, query: &str, select_only: bool) -> std::io::Result<std::process::Output> {
+    if host == "127.0.0.1" || host == "localhost" {
+        let args = if select_only {
+            vec![
+                "exec",
+                "stat-pg-db",
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-t",
+                "-c",
+                query,
+            ]
+        } else {
+            vec![
+                "exec",
+                "stat-pg-db",
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-c",
+                query,
+            ]
+        };
+        std::process::Command::new("docker")
+            .args(&args)
+            .output()
+    } else {
+        let args = if select_only {
+            vec![
+                "-h",
+                host,
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-t",
+                "-c",
+                query,
+            ]
+        } else {
+            vec![
+                "-h",
+                host,
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-c",
+                query,
+            ]
+        };
+        let mut cmd = std::process::Command::new("psql");
+        cmd.env("PGPASSWORD", "postgres");
+        cmd.args(&args).output()
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -134,6 +196,7 @@ fn main() {
     let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Spawn background SQL monitoring thread
+    let host_clone = host.clone();
     let query_thread = thread::spawn(move || {
         let mut run = 1;
         let mut previous_sum = 0.0;
@@ -143,20 +206,7 @@ fn main() {
             thread::sleep(Duration::from_secs(15));
             
             let start = Instant::now();
-            let output = std::process::Command::new("docker")
-                .args(&[
-                    "exec",
-                    "stat-pg-db",
-                    "psql",
-                    "-U",
-                    "postgres",
-                    "-d",
-                    "postgres",
-                    "-t",
-                    "-c",
-                    "SELECT COALESCE(SUM(value::float8), 0.0) FROM evt_secs;",
-                ])
-                .output();
+            let output = run_psql_query(&host_clone, "SELECT COALESCE(SUM(value::float8), 0.0) FROM evt_secs;", true);
             
             let duration = start.elapsed();
             
@@ -333,20 +383,7 @@ fn main() {
     let mut table_sums = HashMap::new();
 
     for table in &tables {
-        let output = std::process::Command::new("docker")
-            .args(&[
-                "exec",
-                "stat-pg-db",
-                "psql",
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-t",
-                "-c",
-                &format!("SELECT COALESCE(SUM(value::float8), 0.0) FROM {};", table),
-            ])
-            .output();
+        let output = run_psql_query(&host, &format!("SELECT COALESCE(SUM(value::float8), 0.0) FROM {};", table), true);
 
         if let Ok(out) = output {
             if out.status.success() {
@@ -398,19 +435,7 @@ fn main() {
                 ('evt_30s')
         ) as t(table_name);
     ";
-    let output = std::process::Command::new("docker")
-        .args(&[
-            "exec",
-            "stat-pg-db",
-            "psql",
-            "-U",
-            "postgres",
-            "-d",
-            "postgres",
-            "-c",
-            space_query,
-        ])
-        .output();
+    let output = run_psql_query(&host, space_query, false);
     if let Ok(out) = output {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);

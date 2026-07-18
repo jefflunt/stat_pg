@@ -18,5 +18,17 @@ services:
       - cargo-cache:/root/.cargo/registry
     restart: unless-stopped
 
+  bench:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: stat-pg-bench
+    volumes:
+      - .:/workspace
+      - cargo-cache:/root/.cargo/registry
+    command: ["tail", "-f", "/dev/null"]
+    depends_on:
+      - db
+
 volumes:
   cargo-cache:
