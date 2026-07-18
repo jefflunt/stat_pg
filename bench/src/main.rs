@@ -140,7 +140,7 @@ fn main() {
         let mut stable_seconds = 0;
 
         loop {
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(15));
             
             let start = Instant::now();
             let output = std::process::Command::new("docker")
@@ -179,8 +179,8 @@ fn main() {
             );
 
             if current_sum == previous_sum && current_sum > 0.0 {
-                stable_seconds += 1;
-                if stable_seconds >= 5 {
+                stable_seconds += 15;
+                if stable_seconds >= 15 {
                     println!("\nDatabase inserts have stabilized. Ingestion queue is fully drained!");
                     break;
                 }
