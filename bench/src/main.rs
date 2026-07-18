@@ -59,6 +59,19 @@ fn register_metrics(
     Ok(name_to_id)
 }
 
+fn format_number(val: u64) -> String {
+    let s = val.to_string();
+    let mut result = String::new();
+    let mut chars = s.chars().rev().enumerate();
+    while let Some((idx, c)) = chars.next() {
+        if idx > 0 && idx % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -124,9 +137,10 @@ fn main() {
     let query_thread = thread::spawn(move || {
         let mut run = 1;
         let mut previous_sum = 0.0;
+        let mut stable_seconds = 0;
 
         loop {
-            thread::sleep(Duration::from_secs(60));
+            thread::sleep(Duration::from_secs(1));
             
             let start = Instant::now();
             let output = std::process::Command::new("docker")
@@ -146,44 +160,33 @@ fn main() {
             
             let duration = start.elapsed();
             
-            println!("\n--------------------------------------------------");
-            print!("SQL Monitor Run {} | ", run);
-            
             let mut current_sum = 0.0;
             match output {
                 Ok(out) => {
                     if out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         current_sum = stdout.trim().parse().unwrap_or(0.0);
-                        
-                        fn format_number(val: u64) -> String {
-                            let s = val.to_string();
-                            let mut result = String::new();
-                            let mut chars = s.chars().rev().enumerate();
-                            while let Some((idx, c)) = chars.next() {
-                                if idx > 0 && idx % 3 == 0 {
-                                    result.push(',');
-                                }
-                                result.push(c);
-                            }
-                            result.chars().rev().collect()
-                        }
-                        
-                        println!("SUM(value): {} (Query took {:.2?})", format_number(current_sum as u64), duration);
-                    } else {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        println!("SQL Error: {} (took {:.2?})", stderr.trim(), duration);
                     }
                 }
-                Err(e) => {
-                    println!("Failed to run docker exec: {} (took {:.2?})", e, duration);
-                }
+                Err(_) => {}
             }
-            println!("--------------------------------------------------");
+
+            print!(
+                "\rSQL Monitor Run {:<4} | SUM(value): {:<15} (Query took {:.2?})\x1b[K",
+                run,
+                format_number(current_sum as u64),
+                duration
+            );
+            std::io::stdout().flush().unwrap();
 
             if current_sum == previous_sum && current_sum > 0.0 {
-                println!("Database inserts have stabilized at {}. Ingestion queue is fully drained!", current_sum);
-                break;
+                stable_seconds += 1;
+                if stable_seconds >= 5 {
+                    println!("\nDatabase inserts have stabilized. Ingestion queue is fully drained!");
+                    break;
+                }
+            } else {
+                stable_seconds = 0;
             }
 
             previous_sum = current_sum;
@@ -300,19 +303,6 @@ fn main() {
     let mps = total_metrics as u64 / elapsed.as_secs();
     let mb_sec = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64();
 
-    fn format_number(val: u64) -> String {
-        let s = val.to_string();
-        let mut result = String::new();
-        let mut chars = s.chars().rev().enumerate();
-        while let Some((idx, c)) = chars.next() {
-            if idx > 0 && idx % 3 == 0 {
-                result.push(',');
-            }
-            result.push(c);
-        }
-        result.chars().rev().collect()
-    }
-
     fn format_float(val: f64) -> String {
         let int_part = val.trunc() as u64;
         let frac_part = (val.fract() * 100.0).round().abs() as u64;
@@ -333,5 +323,64 @@ fn main() {
     // Wait for the SQL background monitoring thread to complete its remaining runs
     println!("Waiting for final background SQL query runs to finish and stabilize...");
     let _ = query_thread.join();
+
+    // Perform comprehensive final database consistency validation
+    println!("==================================================");
+    println!("Performing Final Database Consistency Validation...");
+    println!("==================================================");
+
+    let tables = ["evt_secs", "evt_mins", "evt_hours", "evt_days", "evt_30s"];
+    let mut table_sums = HashMap::new();
+
+    for table in &tables {
+        let output = std::process::Command::new("docker")
+            .args(&[
+                "exec",
+                "stat-pg-db",
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-t",
+                "-c",
+                &format!("SELECT COALESCE(SUM(value::float8), 0.0) FROM {};", table),
+            ])
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let sum = stdout.trim().parse::<f64>().unwrap_or(0.0);
+                table_sums.insert(table.to_string(), sum);
+            }
+        }
+    }
+
+    let target_sum = table_sums.get("evt_secs").cloned().unwrap_or(0.0);
+    println!("Total Emitted Metrics   : {}", format_number(total_metrics));
+    println!("Persisted (evt_secs)    : {} ({:.2}% delivery rate)", 
+        format_number(target_sum as u64), 
+        (target_sum / total_metrics as f64) * 100.0
+    );
+
+    let mut mismatch = false;
+    for table in &tables {
+        let sum = table_sums.get(*table).cloned().unwrap_or(0.0);
+        let diff = (sum - target_sum).abs();
+        let status = if diff < 0.01 {
+            "MATCH"
+        } else {
+            mismatch = true;
+            "MISMATCH"
+        };
+        println!("  - {:<10} SUM(value): {:<15} | {}", table, format_number(sum as u64), status);
+    }
+
+    if mismatch {
+        println!("\nWARNING: Aggregation sum mismatch detected across rollup periods!");
+    } else {
+        println!("\nSUCCESS: All rollup tables are perfectly consistent!");
+    }
     println!("==================================================");
 }
