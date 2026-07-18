@@ -1,16 +1,123 @@
 # stat-pg
 
-A minimalist, high-performance PostgreSQL extension for statistical and log event ingestion and aggregation, written in Rust using the `pgrx` framework.
+A minimalist PostgreSQL extension for metric ingestion and aggregation.
 
-`stat-pg` runs a high-speed TCP socket listener directly inside the PostgreSQL database engine as a background worker process, aggregates metrics in-memory, and writes them to aggregate tables in periodic, transaction-safe batches.
+`stat-pg` runs a TCP socket listener directly inside the PostgreSQL database engine as a background worker process, aggregates metrics in-memory, and writes them to aggregate tables in periodic, transaction-safe batches. By doing this inside the database engine, millions of metrics per second can be aggregated while keeping the data queryable.
 
 ---
 
-## Architecture
+## Design
 
 - **Background Worker**: Spawns on Postgres boot to listen on TCP port `8125` (configurable).
-- **In-Memory Accumulator**: Aggregates metric sums across five resolutions (`secs`, `mins`, `hours`, `days`, `30s`) in memory, avoiding row-level database locking and trigger write-amplification.
+- **In-Memory Accumulator**: Aggregates metric sums across five resolutions (`secs`, `mins`, `hours`, `days`, `30s`)
 - **Transaction-Safe SPI Flush**: Flushes memory caches to tables in a single SQL transaction every `1.0` seconds (configurable).
+
+
+### Super simplified:
+
+* A client sends a metric with:
+  * A metric name (i.e. `api.request.count`)
+  * A 64-bit integer representing the current UTC second
+  * A value for the metric (i.e. a count, `1` - integers and floats supported)
+* A client-side batcher collects metrics locally before sending to the server, in order to send less total traffic to the server. So, multiple `api.request.count` metrics per second are accumulated locally and sent as `api.request.count 1784378411 7`.
+* The server receives the metrics from multiple connected clients, aggregates then in-memory, then flushes the aggregate values to the database once per second (default, configurable).
+
+### One layer deeper: binary encoding, packet stuffing, and metric name -> ID map, and the metrics ring buffer
+
+#### Binary encoding
+
+* In its simplest form the string `api.request.count 1784378411 7` is a valid metric emission. However, that format is very poor for performance.
+* The metrics are instead transmitted in a binary format that doesn't require string parsing on the receiving end.
+
+#### Packet stuffing
+
+Networks transmit data via packets, and packets have a maximum size. A simplified MTU for this is 1,500 bytes, and of that about 1,492 are usable to transmit payload data. The client takes this into account, and stuffs as many client-side aggregated metrics into a single packet as it can without exceeding the MTU in order to minimize network traffic. When the client _either_ has a full packet's worth of data, or it's been 1s since the last packet sent, we send the data we have. In this way data is transmitted at least once per second (for low metric traffic), but can be transmitted much faster for higher volumes.
+
+#### Metric name -> ID mapping
+
+* Sending text metric names such as `api.request.count` for every mtric, and having that matched up to an accumulator metric on the receiving side in the database is very inefficient, because you would need a hash of `String -> accumulator` such that on every metric received there's a Hash lookup. Hashes are quick, but not nearly as fast as Arrays.
+* So, we pay a small RAM footprint penalty to have an array of accumulators on the receiving end (but for, say, 1,000 unique metrics this buffer is still under 64MB -- 10,000 unique metrics would be approximately 10x the RAM, so about 650MB).
+* The first time that a client sends a metric it sends the text-based form. The server then either looks up or assigns an integer ID to that metric name, and responds with this ID so that future metrics sent from the client can use the ID instead of the name. This allows the server-side to index incoming metrics directly into an Array for accumulation/aggregation. So, we trade a slightly slower initial metric emission for a much faster emission thereafter.
+
+#### Metrics ring buffer
+
+On the server side a 5-second aggregation ring buffer is keps in RAM in order to allow some slack time in the arrival of metrics (+/- 2 seconds around the current second). If the connection between client and server is (a) reliable, and (b) a short network distance, and if all system clocks are updated and synchronized to a time server, then this +/- 2 second buffer should be more than sufficient to get at or near 100% metric retention. Metrics outside of this +/- 2 second sliding window are discarded, since this is technically a time configuration issue for the clients, or a network connection problem. In any case, `stat-pg` is designed to provide both very fast real-time metric ingestion, but like StatsD by which it was inspired, some packet loss is considered okay.
+
+
+```
+========================================================================================
+                                    CLIENT / SERVER INTERACTION
+========================================================================================
+
+    CLIENT                                                    PostgreSQL BGWORKER
+  (Sends Metrics)                                            (stat-pg TCP Listener)
+        |                                                                 |
+        |------ 1. Handshake (Type 0x01): Metric Name Registration ------>|
+        |<----- 2. Response (Type 0x01): Assigned ID (4-byte i32) ------- |
+        |                                                                 |
+        |                                                                 |
+        |====== 3. Blast Ingestion Updates (Type 0x02): Binary Payload ==>|
+        |          [Type 0x02] [ID] [Value] [Timestamp]                   |
+        v                                                                 v
+
+========================================================================================
+                                     PACKET STRUCTURES
+========================================================================================
+
+1. REGISTRATION HANDSHAKE (Type 0x01)
+   Request:
+   +-----------+--------------------+----------------------------------+
+   | Type (1B) | Name Length (2B)   | Metric Name String (UTF-8, Var)  |
+   |   0x01    | e.g. 0x0011 (17)   | "api.request.count"              |
+   +-----------+--------------------+----------------------------------+
+   Response:
+   +-----------+--------------------+----------------------------------+-----------------+
+   | Type (1B) | Name Length (2B)   | Metric Name String (UTF-8, Var)  | Metric ID (4B)  |
+   |   0x01    | e.g. 0x0011 (17)   | "api.request.count"              | 1042 (LE i32)   |
+   +-----------+--------------------+----------------------------------+-----------------+
+
+2. INGESTION UPDATE (Type 0x02)
+   +-----------+-----------------+-------------------+---------------------+
+   | Type (1B) | Metric ID (4B)  | Value (8B f64)    | Timestamp (8B i64)  |
+   |   0x02    |  1042 (LE i32)  |   12.5 (LE float) | 1721237340 (LE int) |
+   +-----------+-----------------+-------------------+---------------------+
+
+========================================================================================
+                             IN-MEMORY SLIDING WINDOW (5-Slot Array)
+========================================================================================
+
+  Incoming stream timestamp = 105
+  Window slots mapped using: idx = ts % 5 (window_size)
+
+      Slot 0          Slot 1          Slot 2          Slot 3          Slot 4
+   +------------+  +------------+  +------------+  +------------+  +------------+
+   |  ts: 100   |  |  ts: 101   |  |  ts: 102   |  |  ts: 103   |  |  ts: 104   |
+   |  data:     |  |  data:     |  |  data:     |  |  data:     |  |  data:     |
+   |  [id1: v1] |  |  [id1: v2] |  |  [id1: v3] |  |  [id1: v4] |  |  [id1: v5] |
+   |  [id2: v1] |  |  [id2: v2] |  |  [id2: v3] |  |  [id2: v4] |  |  [id2: v5] |
+   +------------+  +------------+  +------------+  +------------+  +------------+
+         |
+         | (Incoming packet at 105 arrives: idx = 0)
+         v
+  [ EVICT & FLUSH ]  <-- Slot 0 (ts 100) is evicted & overwritten with ts 105
+         |
+         v
+========================================================================================
+                             DATABASE INGESTION (SPI Flush)
+========================================================================================
+
+         |
+         +--> [ Convert Slot Data to Active Entries Array: (metric_id, aggregated_value) ]
+         |
+         +--> [ SPI Parameterized Upsert Transactions ]
+         |
+         +--> [ DB ROLLUP TABLES ]
+              ├── evt_secs (at = 100)
+              ├── evt_mins (at = 100 / 60)
+              ├── evt_hours (at = 100 / 3600)
+              ├── evt_days (at = 100 / 86400)
+              └── evt_30s (at = 100 / 2592000)
+```
 
 ### Network Protocol Format
 
@@ -45,7 +152,7 @@ stat_pg.buffer_window = 5            # Sliding window size in seconds to buffer 
 
 ### Can this be installed on an existing database?
 **Yes!** Since it is a standard PostgreSQL extension, you can install it on any existing database cluster. 
-* **Note**: Because a single background worker process binds to the TCP port, it flushes metrics into the single database configured by `stat_pg.database` (defaulting to `'postgres'`). It is recommended to use a dedicated database or dedicated tables for metrics to isolate the data.
+* **Note**: Because a single background worker process binds to the TCP port, it flushes metrics into the single database configured by `stat_pg.database` (defaulting to `'postgres'`). It is recommended to use a dedicated database or dedicated tables for metrics to isolate the data, especially if you're dealing with 100,000+ metric events per second -- at that point you're going to need a dedicated server for aggregation and reporting. In some tests, depending on the hardware you're running it on, servers with 4 vCPUs can ingest up to 10M metrics per second. Due to the current design of `stat-pg` there is no real benefit to using more cores than this, because all in-memory aggregation results in a single database writer, which means that part of the system is effectively single-threaded. 10M metrics/second of ingestion is still very fast, however.
 
 ---
 
@@ -110,7 +217,7 @@ You can verify the TCP pipeline manually by executing a Python one-liner on your
 
 ## Benchmarking
 
-We have included a high-speed, multi-threaded TCP stress test benchmark tool inside `bench/` to check your environment's ingestion limits.
+Included is a high-speed, multi-threaded TCP stress test benchmark tool inside `bench/` to check your environment's ingestion limits.
 
 ### 1. Compile the Benchmark Tool
 On your host machine, compile the tool in release mode:
@@ -128,9 +235,9 @@ Run the stress test against the local database container:
 **Options**:
 - `--host <ip>` (default: `127.0.0.1`)
 - `--port <port>` (default: `8125`)
-- `--threads <num>` (default: CPU cores)
+- `--threads <num>` (default: CPU cores, though typical tests should limit this to 1-4 threads)
 - `--duration <secs>` (default: 180)
-- `--metrics <num>` (default: 1000)
+- `--metrics <num>` (default: 1000, the cardinality of the incoming data -- i.e. 1,000 uniquely named metrics)
 
 **Example**:
 ```bash
