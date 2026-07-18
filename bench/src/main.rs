@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::env;
-use std::net::UdpSocket;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -7,7 +9,7 @@ use std::thread;
 
 fn print_help() {
     println!(
-        "stat-pg-bench - High-speed UDP stress test benchmark tool\n\n\
+        "stat-pg-bench - High-speed TCP stress test benchmark tool\n\n\
         Usage: stat-pg-bench [OPTIONS]\n\n\
         Options:\n  \
           --host <str>      Target host IP (default: 127.0.0.1)\n  \
@@ -17,6 +19,44 @@ fn print_help() {
           --metrics <u32>   Number of unique metrics to simulate (default: 1000)\n  \
           --help, -h        Print this help menu\n"
     );
+}
+
+fn register_metrics(
+    stream: &mut TcpStream,
+    unique_metrics: u32,
+) -> std::io::Result<HashMap<String, i32>> {
+    let mut name_to_id = HashMap::new();
+
+    for idx in 0..unique_metrics {
+        let name = format!("bench.metric.{}", idx);
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len() as u16;
+
+        // Packet format: [0x01 (1B)] [Length (2B BE)] [Name]
+        let mut req = Vec::with_capacity(3 + name_bytes.len());
+        req.push(0x01);
+        req.extend_from_slice(&name_len.to_be_bytes());
+        req.extend_from_slice(name_bytes);
+
+        stream.write_all(&req)?;
+
+        // Read response: [0x01] [Length (2B)] [Name] [ID (4B LE)]
+        let mut header = [0u8; 3];
+        stream.read_exact(&mut header)?;
+        assert_eq!(header[0], 0x01);
+        let resp_name_len = u16::from_be_bytes([header[1], header[2]]) as usize;
+        
+        let mut body = vec![0u8; resp_name_len + 4];
+        stream.read_exact(&mut body)?;
+        
+        let id_offset = resp_name_len;
+        let id_bytes = &body[id_offset .. id_offset + 4];
+        let assigned_id = i32::from_le_bytes(id_bytes.try_into().unwrap());
+        
+        name_to_id.insert(name, assigned_id);
+    }
+
+    Ok(name_to_id)
 }
 
 fn main() {
@@ -66,49 +106,13 @@ fn main() {
 
     let target_addr = format!("{}:{}", host, port);
     println!("==================================================");
-    println!("stat-pg-bench Starting Variable Binary Stress Test");
+    println!("stat-pg-bench Starting Bidirectional TCP Stress Test");
     println!("Target Address : {}", target_addr);
     println!("Sender Threads : {}", threads);
     println!("Run Duration   : {} seconds (3 minutes)", duration_secs);
     println!("Unique Metrics : {}", unique_metrics);
-    println!("Protocol Format: Variable-Length Binary (1-byte length prefix)");
+    println!("Protocol Format: Bidirectional TCP (ID Handshake)");
     println!("==================================================");
-
-    // Pre-allocate binary metric packet payloads in memory, packed densely under 1,472 bytes MTU
-    println!("Pre-allocating binary metric payloads...");
-    let mut payloads: Vec<(Vec<u8>, u64)> = Vec::new();
-    let mut current_packet: Vec<u8> = Vec::with_capacity(1472);
-    let mut current_metrics_count = 0;
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs() as i64;
-
-    for idx in 0..unique_metrics {
-        let name = format!("bench.metric.{}", idx);
-        let name_bytes = name.as_bytes();
-        let name_len = name_bytes.len();
-        
-        let chunk_size = 1 + name_len + 16;
-
-        if current_packet.len() + chunk_size > 1472 {
-            payloads.push((current_packet, current_metrics_count));
-            current_packet = Vec::with_capacity(1472);
-            current_metrics_count = 0;
-        }
-
-        current_packet.push(name_len as u8);
-        current_packet.extend_from_slice(name_bytes);
-        current_packet.extend_from_slice(&1.0f64.to_le_bytes());
-        current_packet.extend_from_slice(&ts.to_le_bytes());
-        
-        current_metrics_count += 1;
-    }
-    if !current_packet.is_empty() {
-        payloads.push((current_packet, current_metrics_count));
-    }
-    let payloads = Arc::new(payloads);
 
     // Atomic states shared across sender threads
     let running = Arc::new(AtomicBool::new(true));
@@ -117,8 +121,6 @@ fn main() {
     let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Spawn background SQL monitoring thread
-    // Runs query: SELECT SUM(value::float8) FROM evt_secs every 60 seconds
-    // Loop terminates only when SUM(value) remains unchanged (i.e. all inserts are final)
     let query_thread = thread::spawn(move || {
         let mut run = 1;
         let mut previous_sum = 0.0;
@@ -179,7 +181,6 @@ fn main() {
             }
             println!("--------------------------------------------------");
 
-            // If the sum remains the same as the previous check, all backlogged queue items are processed.
             if current_sum == previous_sum && current_sum > 0.0 {
                 println!("Database inserts have stabilized at {}. Ingestion queue is fully drained!", current_sum);
                 break;
@@ -191,7 +192,7 @@ fn main() {
     });
 
     let start_time = Instant::now();
-    let mut worker_handles = Vec::with_capacity(threads);
+    let mut worker_handles = Vec::with_capacity(threads as usize);
 
     // Spawn sender threads
     for thread_id in 0..threads {
@@ -199,30 +200,66 @@ fn main() {
         let packets_clone = packets_sent.clone();
         let metrics_clone = metrics_sent.clone();
         let bytes_clone = bytes_sent.clone();
-        let payloads_clone = payloads.clone();
         let target = target_addr.clone();
 
         let handle = thread::spawn(move || {
-            let socket = UdpSocket::bind("0.0.0.0:0")
-                .expect("Failed to bind thread UDP socket");
+            let mut stream = match TcpStream::connect(&target) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("Thread {} failed to connect to {}: {}", thread_id, target, e);
+                    return;
+                }
+            };
             
+            // Perform metric name registration handshake
+            let name_to_id = match register_metrics(&mut stream, unique_metrics) {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("Thread {} registration handshake failed: {}", thread_id, e);
+                    return;
+                }
+            };
+
             let mut local_packets = 0u64;
             let mut local_metrics = 0u64;
             let mut local_bytes = 0u64;
+            
+            // Write buffer for batching Type 0x02 packets (21 bytes each, 100 packets = 2100 bytes)
+            let mut write_buf = Vec::with_capacity(2100);
             let mut batch_idx = thread_id as usize;
 
             while running_clone.load(Ordering::Relaxed) {
-                let (payload, metrics_in_batch) = &payloads_clone[batch_idx % payloads_clone.len()];
-                
-                if let Ok(bytes) = socket.send_to(payload, &target) {
-                    local_packets += 1;
-                    local_metrics += metrics_in_batch;
-                    local_bytes += bytes as u64;
+                write_buf.clear();
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO)
+                    .as_secs() as i64;
+
+                let mut metrics_in_batch = 0;
+                for _ in 0..100 {
+                    let metric_idx = batch_idx % unique_metrics as usize;
+                    let metric_name = format!("bench.metric.{}", metric_idx);
+                    let &metric_id = name_to_id.get(&metric_name).unwrap();
+
+                    write_buf.push(0x02);
+                    write_buf.extend_from_slice(&metric_id.to_le_bytes());
+                    write_buf.extend_from_slice(&1.0f64.to_le_bytes());
+                    write_buf.extend_from_slice(&ts.to_le_bytes());
+
+                    batch_idx = batch_idx.wrapping_add(threads as usize);
+                    metrics_in_batch += 1;
                 }
 
-                batch_idx = batch_idx.wrapping_add(threads);
+                if stream.write_all(&write_buf).is_ok() {
+                    local_packets += 1;
+                    local_metrics += metrics_in_batch;
+                    local_bytes += write_buf.len() as u64;
+                } else {
+                    // TCP write error, socket closed or dropped
+                    break;
+                }
 
-                if local_packets % 1000 == 0 {
+                if local_packets % 100 == 0 {
                     packets_clone.fetch_add(local_packets, Ordering::Relaxed);
                     metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
                     bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
@@ -235,12 +272,13 @@ fn main() {
             packets_clone.fetch_add(local_packets, Ordering::Relaxed);
             metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
             bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         });
 
         worker_handles.push(handle);
     }
 
-    println!("Blasting UDP packets to target server...");
+    println!("Blasting TCP metric updates to target server...");
 
     // Wait for the duration of the benchmark (180 seconds)
     thread::sleep(Duration::from_secs(duration_secs as u64));
@@ -287,7 +325,7 @@ fn main() {
     println!("Total Packets  : {}", format_number(total_packets));
     println!("Total Metrics  : {}", format_number(total_metrics));
     println!("Total Bytes    : {:.2} MB", total_bytes as f64 / 1_048_576.0);
-    println!("Average PPS    : {} Packets/sec", format_float(pps));
+    println!("Average PPS    : {} Batches/sec (100 updates/batch)", format_float(pps));
     println!("Average MPS    : {} Metrics/sec (Ingested)", format_number(mps));
     println!("Throughput     : {:.2} MB/sec", mb_sec);
     println!("==================================================");

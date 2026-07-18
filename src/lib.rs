@@ -3,49 +3,55 @@ use pgrx::prelude::*;
 use pgrx::guc::*;
 use pgrx::spi::SpiClient;
 use pgrx::datum::DatumWithOid;
-use std::collections::{HashMap, HashSet};
+use crate::pg_sys::PgOid;
+use std::collections::HashMap;
 use std::ffi::CString;
-use std::net::UdpSocket;
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::thread;
+use std::panic::AssertUnwindSafe;
 
 pgrx::pg_module_magic!();
 
 // Tables definition using extension_sql!
 extension_sql!(
     r#"
+    CREATE TABLE IF NOT EXISTS stat_pg_metrics (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR NOT NULL UNIQUE
+    );
     CREATE TABLE IF NOT EXISTS evt_secs (
-        code VARCHAR NOT NULL,
+        metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DECIMAL(20, 12) NOT NULL,
-        PRIMARY KEY (at, code)
+        PRIMARY KEY (at, metric_id)
     );
     CREATE TABLE IF NOT EXISTS evt_mins (
-        code VARCHAR NOT NULL,
+        metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DECIMAL(20, 12) NOT NULL,
-        PRIMARY KEY (at, code)
+        PRIMARY KEY (at, metric_id)
     );
     CREATE TABLE IF NOT EXISTS evt_hours (
-        code VARCHAR NOT NULL,
+        metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DECIMAL(20, 12) NOT NULL,
-        PRIMARY KEY (at, code)
+        PRIMARY KEY (at, metric_id)
     );
     CREATE TABLE IF NOT EXISTS evt_days (
-        code VARCHAR NOT NULL,
+        metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DECIMAL(20, 12) NOT NULL,
-        PRIMARY KEY (at, code)
+        PRIMARY KEY (at, metric_id)
     );
     CREATE TABLE IF NOT EXISTS evt_30s (
-        code VARCHAR NOT NULL,
+        metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DECIMAL(20, 12) NOT NULL,
-        PRIMARY KEY (at, code)
+        PRIMARY KEY (at, metric_id)
     );
     "#,
     name = "create_evt_tables"
@@ -57,6 +63,7 @@ static DB_USER: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new
 static BIND_ADDR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static PORT: GucSetting<i32> = GucSetting::<i32>::new(8125);
 static FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new(1.0);
+static BUFFER_WINDOW: GucSetting<i32> = GucSetting::<i32>::new(5);
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -80,8 +87,8 @@ pub extern "C-unwind" fn _PG_init() {
 
     GucRegistry::define_string_guc(
         c"stat_pg.bind_address",
-        c"IP address to bind the UDP socket to",
-        c"The local IP address that the UDP listener socket binds to.",
+        c"IP address to bind the TCP listener to",
+        c"The local IP address that the TCP listener socket binds to.",
         &BIND_ADDR,
         GucContext::Sighup,
         GucFlags::default(),
@@ -89,8 +96,8 @@ pub extern "C-unwind" fn _PG_init() {
 
     GucRegistry::define_int_guc(
         c"stat_pg.port",
-        c"UDP port to listen on",
-        c"The local UDP port that the listener socket binds to.",
+        c"TCP port to listen on",
+        c"The local TCP port that the listener socket binds to.",
         &PORT,
         1024,
         65535,
@@ -109,6 +116,17 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_int_guc(
+        c"stat_pg.buffer_window",
+        c"Aggregator sliding window size in seconds",
+        c"The sliding window size (in seconds) to buffer metrics and absorb network delay or jitter.",
+        &BUFFER_WINDOW,
+        1,
+        60,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
     BackgroundWorkerBuilder::new("stat_pg_aggregator")
         .set_function("stat_pg_main")
         .set_library("stat_pg")
@@ -118,93 +136,282 @@ pub extern "C-unwind" fn _PG_init() {
         .load();
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct Metric {
-    code: Arc<str>,
-    value: f64,
-    at: i64,
+struct RegRequest {
+    name: String,
+    resp: Sender<i32>,
 }
 
-#[derive(Default)]
-struct MetricCache {
-    secs: HashMap<(Arc<str>, i64), f64>,
-    mins: HashMap<(Arc<str>, i64), f64>,
-    hours: HashMap<(Arc<str>, i64), f64>,
-    days: HashMap<(Arc<str>, i64), f64>,
-    days30: HashMap<(Arc<str>, i64), f64>,
+struct Slot {
+    timestamp: i64,
+    data: Vec<f64>,
 }
 
-impl MetricCache {
-    fn add(&mut self, m: Metric) {
-        let code = m.code;
-        let val = m.value;
-        let ts = m.at;
+struct SlidingWindow {
+    window_size: usize,
+    slots: Vec<Slot>,
+    max_timestamp: i64,
+}
 
-        // In the hot path, we ONLY insert/aggregate into the seconds map.
-        // This cuts down hashing overhead in the parser loop by 80% (1 lookup instead of 5).
-        self.secs.entry((code, ts)).and_modify(|e| *e += val).or_insert(val);
-    }
-
-    fn populate_rollups(&mut self) {
-        for ((code, ts), &val) in &self.secs {
-            // minutes
-            let min_ts = ts / 60;
-            self.mins.entry((code.clone(), min_ts)).and_modify(|e| *e += val).or_insert(val);
-            // hours
-            let hr_ts = ts / 3600;
-            self.hours.entry((code.clone(), hr_ts)).and_modify(|e| *e += val).or_insert(val);
-            // days
-            let day_ts = ts / 86400;
-            self.days.entry((code.clone(), day_ts)).and_modify(|e| *e += val).or_insert(val);
-            // 30-days
-            let day30_ts = ts / 2592000;
-            self.days30.entry((code.clone(), day30_ts)).and_modify(|e| *e += val).or_insert(val);
+impl SlidingWindow {
+    fn new(window_size: usize) -> Self {
+        let mut slots = Vec::with_capacity(window_size);
+        for _ in 0..window_size {
+            slots.push(Slot {
+                timestamp: 0,
+                data: Vec::new(),
+            });
+        }
+        Self {
+            window_size,
+            slots,
+            max_timestamp: 0,
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.secs.is_empty()
-    }
-}
+    fn add(&mut self, metric_id: usize, value: f64, ts: i64, client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
+        let w = self.window_size;
 
-fn parse_variable_binary(
-    packet: &[u8],
-    pool: &mut HashSet<Arc<str>>,
-    cache: &mut MetricCache,
-    processed_metrics: &mut usize,
-) {
-    let mut offset = 0;
-    while offset + 17 <= packet.len() {
-        let name_len = packet[offset] as usize;
-        if offset + 1 + name_len + 16 > packet.len() {
-            break; // Partial metric or malformed buffer chunk
-        }
-
-        let name_bytes = &packet[offset + 1 .. offset + 1 + name_len];
-        if let Ok(code_str) = std::str::from_utf8(name_bytes) {
-            let val_offset = offset + 1 + name_len;
-            if let (Some(val_bytes), Some(ts_bytes)) = (
-                packet.get(val_offset .. val_offset + 8),
-                packet.get(val_offset + 8 .. val_offset + 16)
-            ) {
-                let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
-                let at = i64::from_le_bytes(ts_bytes.try_into().unwrap());
-
-                // Interning lookup: get reference-counted slice
-                let code = if let Some(interned) = pool.get(code_str) {
-                    interned.clone()
-                } else {
-                    let interned: Arc<str> = Arc::from(code_str);
-                    pool.insert(interned.clone());
-                    interned
-                };
-
-                cache.add(Metric { code, value, at });
-                *processed_metrics += 1;
+        if ts > self.max_timestamp {
+            if self.max_timestamp == 0 {
+                self.max_timestamp = ts;
+                for i in 0..w {
+                    self.slots[i].timestamp = ts - (w as i64 - 1) + (i as i64);
+                }
+            } else {
+                for t in (self.max_timestamp + 1)..=ts {
+                    let idx = (t % w as i64) as usize;
+                    if self.slots[idx].timestamp > 0 {
+                        flush_slot(client, self.slots[idx].timestamp, &self.slots[idx].data)?;
+                    }
+                    self.slots[idx].timestamp = t;
+                    self.slots[idx].data.clear();
+                }
+                self.max_timestamp = ts;
             }
         }
-        offset += 1 + name_len + 16;
+
+        let min_ts = self.max_timestamp - w as i64 + 1;
+        if ts >= min_ts && ts <= self.max_timestamp {
+            let idx = (ts % w as i64) as usize;
+            if self.slots[idx].timestamp == ts {
+                if metric_id >= self.slots[idx].data.len() {
+                    self.slots[idx].data.resize(metric_id + 1, 0.0);
+                }
+                self.slots[idx].data[metric_id] += value;
+            }
+        } else {
+            // Packet is older than our window - execute directly to prevent data loss
+            let mut single_data = Vec::new();
+            single_data.resize(metric_id + 1, 0.0);
+            single_data[metric_id] = value;
+            flush_slot(client, ts, &single_data)?;
+        }
+
+        Ok(())
     }
+
+    fn flush_expired(&mut self, client: &mut SpiClient<'_>, max_age_seconds: i64) -> Result<(), pgrx::spi::Error> {
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs() as i64;
+        
+        let oldest_allowed = now_sec - max_age_seconds;
+
+        for slot in &mut self.slots {
+            if slot.timestamp > 0 && slot.timestamp < oldest_allowed {
+                let has_data = slot.data.iter().any(|&v| v > 0.0);
+                if has_data {
+                    flush_slot(client, slot.timestamp, &slot.data)?;
+                }
+                slot.timestamp = 0;
+                slot.data.clear();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn flush_slot(client: &mut SpiClient<'_>, ts: i64, data: &[f64]) -> Result<(), pgrx::spi::Error> {
+    let mut active_entries = Vec::new();
+    for (metric_id, &value) in data.iter().enumerate() {
+        if value > 0.0 {
+            active_entries.push((metric_id as i32, value));
+        }
+    }
+    if active_entries.is_empty() {
+        return Ok(());
+    }
+    
+    // Aggregate values to all rollup periods and flush
+    flush_table_slice(client, "evt_secs", ts, &active_entries)?;
+    flush_table_slice(client, "evt_mins", ts / 60, &active_entries)?;
+    flush_table_slice(client, "evt_hours", ts / 3600, &active_entries)?;
+    flush_table_slice(client, "evt_days", ts / 86400, &active_entries)?;
+    flush_table_slice(client, "evt_30s", ts / 2592000, &active_entries)?;
+
+    Ok(())
+}
+
+fn make_batch_insert_query(table_name: &str, batch_size: usize) -> String {
+    let mut sql = format!("INSERT INTO {} (metric_id, at, value) VALUES ", table_name);
+    for i in 0..batch_size {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        let base = i * 3;
+        sql.push_str(&format!("(${}, ${}, ${})", base + 1, base + 2, base + 3));
+    }
+    sql.push_str(&format!(
+        " ON CONFLICT (at, metric_id) DO UPDATE SET value = {}.value + EXCLUDED.value;",
+        table_name
+    ));
+    sql
+}
+
+fn flush_table_slice(
+    client: &mut SpiClient<'_>,
+    table_name: &str,
+    ts: i64,
+    entries: &[(i32, f64)],
+) -> Result<(), pgrx::spi::Error> {
+    let mut index = 0;
+    let total = entries.len();
+    let chunks = [5000, 500, 1];
+
+    for &chunk_size in &chunks {
+        if index >= total {
+            break;
+        }
+
+        if index + chunk_size <= total {
+            let sql = make_batch_insert_query(table_name, chunk_size);
+            
+            let mut arg_types = Vec::with_capacity(chunk_size * 3);
+            for _ in 0..chunk_size {
+                arg_types.push(PgOid::from(pg_sys::INT4OID));
+                arg_types.push(PgOid::from(pg_sys::INT8OID));
+                arg_types.push(PgOid::from(pg_sys::FLOAT8OID));
+            }
+
+            let prepared = client.prepare_mut(&sql, &arg_types)?;
+
+            while index + chunk_size <= total {
+                let mut args = Vec::with_capacity(chunk_size * 3);
+                for i in 0..chunk_size {
+                    let (metric_id, value) = entries[index + i];
+                    args.push(DatumWithOid::from(metric_id));
+                    args.push(DatumWithOid::from(ts));
+                    args.push(DatumWithOid::from(value));
+                }
+                client.update(&prepared, None, &args)?;
+                index += chunk_size;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_client(
+    mut stream: std::net::TcpStream,
+    shared_cache: Arc<std::sync::RwLock<HashMap<String, i32>>>,
+    reg_tx: Sender<RegRequest>,
+    metric_tx: Sender<(i32, f64, i64)>,
+    running: Arc<AtomicBool>,
+) {
+    use std::io::Read;
+    use std::io::Write;
+
+    let mut buf = vec![0u8; 65536];
+    let mut read_buf = Vec::new();
+
+    if let Err(_) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
+        return;
+    }
+
+    while running.load(Ordering::Relaxed) {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                read_buf.extend_from_slice(&buf[..n]);
+                
+                let mut offset = 0;
+                while offset < read_buf.len() {
+                    let msg_type = read_buf[offset];
+                    if msg_type == 0x01 {
+                        if offset + 3 > read_buf.len() {
+                            break;
+                        }
+                        let name_len = u16::from_be_bytes([read_buf[offset + 1], read_buf[offset + 2]]) as usize;
+                        if offset + 3 + name_len > read_buf.len() {
+                            break;
+                        }
+                        
+                        let name_bytes = &read_buf[offset + 3 .. offset + 3 + name_len];
+                        if let Ok(name_str) = std::str::from_utf8(name_bytes) {
+                            let mut id = {
+                                let read_guard = shared_cache.read().unwrap();
+                                read_guard.get(name_str).cloned()
+                            };
+                            
+                            if id.is_none() {
+                                let (tx_resp, rx_resp) = channel();
+                                let req = RegRequest {
+                                    name: name_str.to_string(),
+                                    resp: tx_resp,
+                                };
+                                if reg_tx.send(req).is_ok() {
+                                    id = rx_resp.recv().ok();
+                                }
+                            }
+                            
+                            let final_id = id.unwrap_or(-1);
+                            
+                            let mut resp = Vec::with_capacity(3 + name_len + 4);
+                            resp.push(0x01);
+                            resp.extend_from_slice(&(name_len as u16).to_be_bytes());
+                            resp.extend_from_slice(name_bytes);
+                            resp.extend_from_slice(&final_id.to_le_bytes());
+                            let _ = stream.write_all(&resp);
+                        }
+                        offset += 3 + name_len;
+                    } else if msg_type == 0x02 {
+                        if offset + 21 > read_buf.len() {
+                            break;
+                        }
+                        let id_bytes = &read_buf[offset + 1 .. offset + 5];
+                        let val_bytes = &read_buf[offset + 5 .. offset + 13];
+                        let ts_bytes = &read_buf[offset + 13 .. offset + 21];
+                        
+                        let metric_id = i32::from_le_bytes(id_bytes.try_into().unwrap());
+                        let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
+                        let at = i64::from_le_bytes(ts_bytes.try_into().unwrap());
+                        
+                        let _ = metric_tx.send((metric_id, value, at));
+                        offset += 21;
+                    } else {
+                        offset += 1;
+                    }
+                }
+                
+                if offset > 0 {
+                    read_buf.drain(..offset);
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Timeout, loop to check running state
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+// Wrapper structure for thread worker state captured by the transaction closure
+struct WorkerState {
+    sliding_window: SlidingWindow,
+    last_flush: SystemTime,
+    metrics_processed: i32,
+    spi_err: Option<pgrx::spi::SpiError>,
 }
 
 #[pg_guard]
@@ -226,90 +433,177 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
 
     BackgroundWorker::connect_worker_to_spi(Some(&db_name), Some(&db_user));
 
-    let socket_addr = format!("{}:{}", bind_addr, port);
-    let socket = match UdpSocket::bind(&socket_addr) {
-        Ok(s) => {
-            log!("stat-pg: bound UDP socket to {}", socket_addr);
-            s
-        }
+    // Load existing metrics lookup cache from database
+    let name_to_id_result = BackgroundWorker::transaction(|| {
+        let mut cache = HashMap::new();
+        Spi::connect_mut(|client| {
+            let table_exists: bool = client.select(
+                "SELECT EXISTS (SELECT FROM pg_tables WHERE tablename = 'stat_pg_metrics');",
+                None, &[]
+            )?.first().get_one()?.unwrap_or(false);
+
+            if table_exists {
+                let tuples = client.select("SELECT id, name FROM stat_pg_metrics;", None, &[])?;
+                for row in tuples {
+                    let id: i32 = row.get_by_name("id")?.expect("id field");
+                    let name: String = row.get_by_name("name")?.expect("name field");
+                    cache.insert(name, id);
+                }
+            }
+            Ok::<(), pgrx::spi::Error>(())
+        })?;
+        Ok::<HashMap<String, i32>, pgrx::spi::Error>(cache)
+    });
+
+    let name_to_id = match name_to_id_result {
+        Ok(cache) => cache,
         Err(e) => {
-            log!("stat-pg: failed to bind UDP socket to {}: {}", socket_addr, e);
-            return;
+            log!("stat-pg: failed to load existing metrics cache: {:?}", e);
+            HashMap::new()
         }
     };
-
-    if let Err(e) = socket.set_read_timeout(Some(Duration::from_millis(100))) {
-        log!("stat-pg: failed to set read timeout on socket: {}", e);
-        return;
-    }
+    let shared_cache = Arc::new(std::sync::RwLock::new(name_to_id));
 
     let running = Arc::new(AtomicBool::new(true));
-    let running_clone = running.clone();
-    let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel();
 
-    // Spawn high-speed UDP receiver thread
-    // CRITICAL: We DO NOT call any pg_sys/pgrx functions (like worker_continue() or log!)
-    // inside this spawned thread to prevent thread-local memory context segfaults.
+    let (reg_tx, reg_rx) = channel::<RegRequest>();
+    let (metric_tx, metric_rx) = channel::<(i32, f64, i64)>();
+
+    // Spawn TCP listener thread
+    let shared_cache_clone = shared_cache.clone();
+    let reg_tx_clone = reg_tx.clone();
+    let metric_tx_clone = metric_tx.clone();
+    let running_thread = running.clone();
+
     thread::spawn(move || {
-        let mut buf = [0u8; 65536];
+        let socket_addr = format!("{}:{}", bind_addr, port);
+        let listener = match TcpListener::bind(&socket_addr) {
+            Ok(l) => {
+                eprintln!("stat-pg: bound TCP listener to {}", socket_addr);
+                l
+            }
+            Err(e) => {
+                eprintln!("stat-pg: failed to bind TCP listener to {}: {}", socket_addr, e);
+                return;
+            }
+        };
 
-        while running_clone.load(Ordering::Relaxed) {
-            match socket.recv_from(&mut buf) {
-                Ok((amt, _src)) => {
-                    let mut vec = vec![0u8; amt];
-                    vec.copy_from_slice(&buf[..amt]);
-                    let _ = tx.send(vec);
+        if let Err(e) = listener.set_nonblocking(true) {
+            eprintln!("stat-pg: failed to set TCP listener non-blocking: {}", e);
+            return;
+        }
+
+        while running_thread.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    let cache = shared_cache_clone.clone();
+                    let r_tx = reg_tx_clone.clone();
+                    let m_tx = metric_tx_clone.clone();
+                    let run = running_thread.clone();
+                    thread::spawn(move || {
+                        handle_client(stream, cache, r_tx, m_tx, run);
+                    });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Timeout reached, loop again to check running state
+                    thread::sleep(Duration::from_millis(50));
                 }
-                Err(_e) => {
-                    // Ignored receiver error
-                }
+                Err(_) => {}
             }
         }
     });
 
-    let mut cache = MetricCache::default();
-    let mut last_flush = SystemTime::now();
-    let mut intern_pool = HashSet::new();
+    let buffer_window = BUFFER_WINDOW.get() as usize;
+
+    let mut state = WorkerState {
+        sliding_window: SlidingWindow::new(buffer_window),
+        last_flush: SystemTime::now(),
+        metrics_processed: 0,
+        spi_err: None,
+    };
+
+    // Use a raw pointer wrapped in AssertUnwindSafe to safely share state
+    // across the UnwindSafe transaction closures without capturing mut references.
+    let state_ptr = &mut state as *mut WorkerState;
+    let state_safe = AssertUnwindSafe(state_ptr);
 
     while BackgroundWorker::worker_continue() {
-        // 1. Process packet payloads from the channel (up to 500,000 metrics per iteration to prevent starvation)
-        let mut processed_metrics = 0;
-        while processed_metrics < 500_000 {
-            if let Ok(packet_bytes) = rx.try_recv() {
-                parse_variable_binary(&packet_bytes, &mut intern_pool, &mut cache, &mut processed_metrics);
-            } else {
-                break;
-            }
-        }
+        // 1. Process dynamic metric registration requests from clients
+        while let Ok(req) = reg_rx.try_recv() {
+            let id = {
+                let read_guard = shared_cache.read().unwrap();
+                read_guard.get(&req.name).cloned()
+            };
 
-        // 2. Check if it's time to flush to the tables
-        let now = SystemTime::now();
-        let elapsed = now.duration_since(last_flush).unwrap_or(Duration::ZERO);
-        if elapsed.as_secs_f64() >= flush_sec {
-            if !cache.is_empty() {
-                cache.populate_rollups(); // Run the rollup aggregation only once per second!
+            if let Some(existing_id) = id {
+                let _ = req.resp.send(existing_id);
+            } else {
                 let result = BackgroundWorker::transaction(|| {
                     Spi::connect_mut(|client| {
-                        if let Err(e) = flush_tables(client, &cache) {
-                            log!("stat-pg SPI flush error: {:?}", e);
-                        }
-                        Ok::<(), pgrx::spi::Error>(())
+                        let query = "INSERT INTO stat_pg_metrics (name) VALUES ($1) \
+                                     ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name \
+                                     RETURNING id;";
+                        let args = vec![DatumWithOid::from(req.name.as_str())];
+                        let id = client.update(query, None, &args)?
+                            .first()
+                            .get_one::<i32>()?
+                            .expect("Expected OID");
+                        Ok::<i32, pgrx::spi::Error>(id)
                     })
                 });
-                if let Err(e) = result {
-                    log!("stat-pg SPI connection error: {:?}", e);
+                match result {
+                    Ok(new_id) => {
+                        let mut write_guard = shared_cache.write().unwrap();
+                        write_guard.insert(req.name.clone(), new_id);
+                        let _ = req.resp.send(new_id);
+                    }
+                    Err(e) => {
+                        log!("stat-pg: failed to register metric name: {:?}", e);
+                        let _ = req.resp.send(-1);
+                    }
                 }
-                cache = MetricCache::default();
             }
-            last_flush = now;
         }
 
-        // 3. Briefly yield execution to avoid CPU pegging
-        // Adaptive sleep latch: sleep only 1ms under load to maximize throughput, or 50ms when idle
-        let sleep_dur = if processed_metrics > 0 {
+        // 2. Connect to SPI to aggregate incoming metrics and flush
+        let result = BackgroundWorker::transaction(|| {
+            // SAFETY: Single-threaded background worker main loop execution
+            let s = unsafe { &mut *state_safe.0 };
+
+            Spi::connect_mut(|client| {
+                s.metrics_processed = 0;
+                while s.metrics_processed < 500_000 {
+                    if let Ok((metric_id, value, at)) = metric_rx.try_recv() {
+                        if let Err(e) = s.sliding_window.add(metric_id as usize, value, at, client) {
+                            s.spi_err = Some(e);
+                            break;
+                        }
+                        s.metrics_processed += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                let now = SystemTime::now();
+                let elapsed = now.duration_since(s.last_flush).unwrap_or(Duration::ZERO);
+                if elapsed.as_secs_f64() >= flush_sec {
+                    if let Err(e) = s.sliding_window.flush_expired(client, buffer_window as i64) {
+                        s.spi_err = Some(e);
+                    }
+                    s.last_flush = now;
+                }
+
+                Ok::<(), pgrx::spi::Error>(())
+            })
+        });
+
+        if let Err(e) = result {
+            log!("stat-pg SPI connection transaction error: {:?}", e);
+        }
+        if let Some(ref e) = state.spi_err {
+            log!("stat-pg SPI execution error: {:?}", e);
+        }
+
+        let sleep_dur = if state.metrics_processed > 0 {
             Duration::from_millis(1)
         } else {
             Duration::from_millis(50)
@@ -317,136 +611,8 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         BackgroundWorker::wait_latch(Some(sleep_dur));
     }
 
-    // Shut down spawned thread
     running.store(false, Ordering::Relaxed);
     log!("stat-pg background worker stopped");
-}
-
-fn flush_tables(client: &mut SpiClient<'_>, cache: &MetricCache) -> Result<(), pgrx::spi::Error> {
-    flush_table(client, "evt_secs", &cache.secs)?;
-    flush_table(client, "evt_mins", &cache.mins)?;
-    flush_table(client, "evt_hours", &cache.hours)?;
-    flush_table(client, "evt_days", &cache.days)?;
-    flush_table(client, "evt_30s", &cache.days30)?;
-    Ok(())
-}
-
-fn make_batch_insert_query(table_name: &str, batch_size: usize) -> String {
-    let mut sql = format!("INSERT INTO {} (code, at, value) VALUES ", table_name);
-    for i in 0..batch_size {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        let base = i * 3;
-        sql.push_str(&format!("(${}, ${}, ${})", base + 1, base + 2, base + 3));
-    }
-    sql.push_str(&format!(
-        " ON CONFLICT (at, code) DO UPDATE SET value = {}.value + EXCLUDED.value;",
-        table_name
-    ));
-    sql
-}
-
-fn flush_table(
-    client: &mut SpiClient<'_>,
-    table_name: &str,
-    data: &HashMap<(Arc<str>, i64), f64>,
-) -> Result<(), pgrx::spi::Error> {
-    if data.is_empty() {
-        return Ok(());
-    }
-
-    let entries: Vec<(&(Arc<str>, i64), &f64)> = data.iter().collect();
-    let mut index = 0;
-    let total = entries.len();
-
-    // Target bulk insertion chunk sizes
-    let chunks = [5000, 500, 1];
-
-    for &chunk_size in &chunks {
-        if index >= total {
-            break;
-        }
-
-        // Prepare the statement once for this chunk size if we have enough elements left
-        if index + chunk_size <= total {
-            let sql = make_batch_insert_query(table_name, chunk_size);
-            
-            // Build the argument type list
-            let mut arg_types = Vec::with_capacity(chunk_size * 3);
-            for _ in 0..chunk_size {
-                arg_types.push(PgOid::from(pg_sys::TEXTOID));
-                arg_types.push(PgOid::from(pg_sys::INT8OID));
-                arg_types.push(PgOid::from(pg_sys::FLOAT8OID));
-            }
-
-            let prepared = client.prepare_mut(&sql, &arg_types)?;
-
-            while index + chunk_size <= total {
-                let mut args = Vec::with_capacity(chunk_size * 3);
-                for i in 0..chunk_size {
-                    let ((code, at), value) = entries[index + i];
-                    args.push(DatumWithOid::from(code.as_ref()));
-                    args.push(DatumWithOid::from(*at));
-                    args.push(DatumWithOid::from(*value));
-                }
-                client.update(&prepared, None, &args)?;
-                index += chunk_size;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-// Unit Tests for packet parsing
-#[cfg(test)]
-mod unit_tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_variable_binary_valid() {
-        let mut pool = HashSet::new();
-        let mut cache = MetricCache::default();
-        let mut processed = 0;
-
-        // Build a packet with two metrics
-        let mut packet = Vec::new();
-
-        // Metric 1: "api.req" (7 chars), value 5.5, ts 1000
-        packet.push(7u8);
-        packet.extend_from_slice(b"api.req");
-        packet.extend_from_slice(&5.5f64.to_le_bytes());
-        packet.extend_from_slice(&1000i64.to_le_bytes());
-
-        // Metric 2: "db.query" (8 chars), value 10.2, ts 2000
-        packet.push(8u8);
-        packet.extend_from_slice(b"db.query");
-        packet.extend_from_slice(&10.2f64.to_le_bytes());
-        packet.extend_from_slice(&2000i64.to_le_bytes());
-
-        parse_variable_binary(&packet, &mut pool, &mut cache, &mut processed);
-
-        assert_eq!(processed, 2);
-        assert_eq!(*cache.secs.get(&(Arc::from("api.req"), 1000)).unwrap(), 5.5);
-        assert_eq!(*cache.secs.get(&(Arc::from("db.query"), 2000)).unwrap(), 10.2);
-    }
-
-    #[test]
-    fn test_parse_variable_binary_malformed() {
-        let mut pool = HashSet::new();
-        let mut cache = MetricCache::default();
-        let mut processed = 0;
-
-        // Build a partial metric
-        let mut packet = Vec::new();
-        packet.push(5u8);
-        packet.extend_from_slice(b"short"); // missing value and ts
-
-        parse_variable_binary(&packet, &mut pool, &mut cache, &mut processed);
-        assert_eq!(processed, 0);
-        assert!(cache.secs.is_empty());
-    }
 }
 
 // Database Integration Tests running inside live PostgreSQL
@@ -454,25 +620,23 @@ mod unit_tests {
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
-    use std::sync::Arc;
 
     #[pg_test]
     fn test_table_insertion_and_upsert() {
         Spi::connect_mut(|client| {
-            // Verify our tables are created and we can flush into them
-            let mut cache = crate::MetricCache::default();
-            cache.add(crate::Metric {
-                code: Arc::from("test_metric"),
-                value: 4.5,
-                at: 1000,
-            });
+            // 1. Insert metric names lookup
+            client.update(
+                "INSERT INTO stat_pg_metrics (id, name) VALUES (1, 'test_metric') ON CONFLICT DO NOTHING;",
+                None, &[]
+            ).unwrap();
 
-            cache.populate_rollups();
-            crate::flush_tables(client, &cache).expect("Flush tables failed");
+            // 2. Perform aggregate flush of a slot
+            let data = vec![0.0, 4.5]; // index 1 is test_metric
+            crate::flush_slot(client, 1000, &data).expect("Flush slot failed");
 
             // Query check for seconds
             let val = client.select(
-                "SELECT value::float8 FROM evt_secs WHERE code = 'test_metric' AND at = 1000;",
+                "SELECT value::float8 FROM evt_secs WHERE metric_id = 1 AND at = 1000;",
                 None, &[]
             ).expect("Select failed")
             .first()
@@ -483,19 +647,12 @@ mod tests {
             assert_eq!(val, 4.5);
 
             // Upsert (conflict update) check
-            let mut cache2 = crate::MetricCache::default();
-            cache2.add(crate::Metric {
-                code: Arc::from("test_metric"),
-                value: 5.5,
-                at: 1000,
-            });
-
-            cache2.populate_rollups();
-            crate::flush_tables(client, &cache2).expect("Flush tables failed");
+            let data2 = vec![0.0, 5.5];
+            crate::flush_slot(client, 1000, &data2).expect("Flush slot failed");
 
             // Query check again (value should be aggregated: 4.5 + 5.5 = 10.0)
             let val2 = client.select(
-                "SELECT value::float8 FROM evt_secs WHERE code = 'test_metric' AND at = 1000;",
+                "SELECT value::float8 FROM evt_secs WHERE metric_id = 1 AND at = 1000;",
                 None, &[]
             ).expect("Select failed")
             .first()
