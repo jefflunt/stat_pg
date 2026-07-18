@@ -316,7 +316,7 @@ fn handle_client(
     mut stream: std::net::TcpStream,
     shared_cache: Arc<std::sync::RwLock<HashMap<String, i32>>>,
     reg_tx: Sender<RegRequest>,
-    metric_tx: Sender<(i32, f64, i64)>,
+    metric_tx: crossbeam_channel::Sender<Vec<(i32, f64, i64)>>,
     running: Arc<AtomicBool>,
 ) {
     use std::io::Read;
@@ -324,6 +324,7 @@ fn handle_client(
 
     let mut buf = vec![0u8; 65536];
     let mut read_buf = Vec::new();
+    let mut batch = Vec::with_capacity(1024);
 
     if let Err(_) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         return;
@@ -387,7 +388,13 @@ fn handle_client(
                         let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
                         let at = i64::from_le_bytes(ts_bytes.try_into().unwrap());
                         
-                        let _ = metric_tx.send((metric_id, value, at));
+                        batch.push((metric_id, value, at));
+                        if batch.len() >= 1024 {
+                            let old_batch = std::mem::replace(&mut batch, Vec::with_capacity(1024));
+                            if metric_tx.send(old_batch).is_err() {
+                                break;
+                            }
+                        }
                         offset += 21;
                     } else {
                         offset += 1;
@@ -403,6 +410,10 @@ fn handle_client(
             }
             Err(_) => break,
         }
+    }
+
+    if !batch.is_empty() {
+        let _ = metric_tx.send(batch);
     }
 }
 
@@ -467,7 +478,7 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     let running = Arc::new(AtomicBool::new(true));
 
     let (reg_tx, reg_rx) = channel::<RegRequest>();
-    let (metric_tx, metric_rx) = channel::<(i32, f64, i64)>();
+    let (metric_tx, metric_rx) = crossbeam_channel::bounded::<Vec<(i32, f64, i64)>>(1024);
 
     // Spawn TCP listener thread
     let shared_cache_clone = shared_cache.clone();
@@ -570,18 +581,24 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
             let s = unsafe { &mut *state_safe.0 };
 
             Spi::connect_mut(|client| {
-                s.metrics_processed = 0;
-                while s.metrics_processed < 500_000 {
-                    if let Ok((metric_id, value, at)) = metric_rx.try_recv() {
-                        if let Err(e) = s.sliding_window.add(metric_id as usize, value, at, client) {
-                            s.spi_err = Some(e);
+                let mut processed = 0;
+                while processed < 500_000 {
+                    if let Ok(batch) = metric_rx.try_recv() {
+                        for (metric_id, value, at) in batch {
+                            if let Err(e) = s.sliding_window.add(metric_id as usize, value, at, client) {
+                                s.spi_err = Some(e);
+                                break;
+                            }
+                            processed += 1;
+                        }
+                        if s.spi_err.is_some() {
                             break;
                         }
-                        s.metrics_processed += 1;
                     } else {
                         break;
                     }
                 }
+                s.metrics_processed = processed;
 
                 let now = SystemTime::now();
                 let elapsed = now.duration_since(s.last_flush).unwrap_or(Duration::ZERO);

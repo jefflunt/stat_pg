@@ -20,6 +20,7 @@ pg_bench = ["dep:pgrx-bench"]
 
 [dependencies]
 pgrx = "=0.19.1"
+crossbeam-channel = "0.5"
 
 [dependencies.pgrx-bench]
 version = "=0.19.1"

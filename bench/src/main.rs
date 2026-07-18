@@ -122,7 +122,7 @@ fn main() {
     println!("stat-pg-bench Starting Bidirectional TCP Stress Test");
     println!("Target Address : {}", target_addr);
     println!("Sender Threads : {}", threads);
-    println!("Run Duration   : {} seconds (3 minutes)", duration_secs);
+    println!("Run Duration   : {} seconds ({:.1} minutes)", duration_secs, duration_secs as f64 / 60.0);
     println!("Unique Metrics : {}", unique_metrics);
     println!("Protocol Format: Bidirectional TCP (ID Handshake)");
     println!("==================================================");
@@ -274,6 +274,7 @@ fn main() {
             packets_clone.fetch_add(local_packets, Ordering::Relaxed);
             metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
             bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(100));
             let _ = stream.shutdown(std::net::Shutdown::Both);
         });
 
@@ -381,5 +382,41 @@ fn main() {
     } else {
         println!("\nSUCCESS: All rollup tables are perfectly consistent!");
     }
+    
+    println!("\nTotal Disk Space Used by Tables (including indexes):");
+    let space_query = "
+        SELECT 
+            table_name, 
+            pg_size_pretty(pg_total_relation_size(table_name::regclass)) as total_size
+        FROM (
+            VALUES 
+                ('stat_pg_metrics'),
+                ('evt_secs'),
+                ('evt_mins'),
+                ('evt_hours'),
+                ('evt_days'),
+                ('evt_30s')
+        ) as t(table_name);
+    ";
+    let output = std::process::Command::new("docker")
+        .args(&[
+            "exec",
+            "stat-pg-db",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "postgres",
+            "-c",
+            space_query,
+        ])
+        .output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            println!("{}", stdout);
+        }
+    }
+    
     println!("==================================================");
 }
