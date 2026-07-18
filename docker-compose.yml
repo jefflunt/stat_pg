@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile.dev
     container_name: stat-pg-db
     command: ["postgres", "-c", "shared_preload_libraries=stat_pg"]
+    mem_limit: 64g
     environment:
       POSTGRES_PASSWORD: postgres
       USER: postgres

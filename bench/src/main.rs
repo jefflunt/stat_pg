@@ -2,7 +2,7 @@ use std::env;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::thread;
 
 fn print_help() {
@@ -13,7 +13,7 @@ fn print_help() {
           --host <str>      Target host IP (default: 127.0.0.1)\n  \
           --port <u16>      Target port (default: 8125)\n  \
           --threads <u32>   Sender threads (default: CPU cores)\n  \
-          --duration <u32>  Duration in seconds to run benchmark (default: 10)\n  \
+          --duration <u32>  Duration in seconds to run benchmark (default: 180)\n  \
           --metrics <u32>   Number of unique metrics to simulate (default: 1000)\n  \
           --help, -h        Print this help menu\n"
     );
@@ -30,7 +30,7 @@ fn main() {
     let mut host = "127.0.0.1".to_string();
     let mut port = 8125u16;
     let mut threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let mut duration_secs = 10u32;
+    let mut duration_secs = 180u32; // Changed default to 180 seconds (3 minutes)
     let mut unique_metrics = 1000u32;
 
     // Parse simple command-line arguments
@@ -66,31 +66,47 @@ fn main() {
 
     let target_addr = format!("{}:{}", host, port);
     println!("==================================================");
-    println!("stat-pg-bench Starting Stress Test");
+    println!("stat-pg-bench Starting Variable Binary Stress Test");
     println!("Target Address : {}", target_addr);
     println!("Sender Threads : {}", threads);
-    println!("Run Duration   : {} seconds", duration_secs);
+    println!("Run Duration   : {} seconds (3 minutes)", duration_secs);
     println!("Unique Metrics : {}", unique_metrics);
-    println!("Batching Mode  : MTU-bounded (<1,472 bytes)");
+    println!("Protocol Format: Variable-Length Binary (1-byte length prefix)");
     println!("==================================================");
 
-    // Pre-allocate metric batch payloads in memory to fit strictly under 1,472 bytes
-    println!("Pre-allocating metric payloads...");
-    let mut payloads: Vec<Vec<u8>> = Vec::new();
-    let mut current_batch = String::new();
+    // Pre-allocate binary metric packet payloads in memory, packed densely under 1,472 bytes MTU
+    println!("Pre-allocating binary metric payloads...");
+    let mut payloads: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut current_packet: Vec<u8> = Vec::with_capacity(1472);
+    let mut current_metrics_count = 0;
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64;
 
     for idx in 0..unique_metrics {
-        let line = format!("bench.metric.{} 1\n", idx);
-        // If adding this line would exceed the safe UDP MTU payload limit (1,472 bytes),
-        // push the current batch and start a new one.
-        if current_batch.len() + line.len() > 1472 {
-            payloads.push(current_batch.into_bytes());
-            current_batch = String::new();
+        let name = format!("bench.metric.{}", idx);
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len();
+        
+        let chunk_size = 1 + name_len + 16;
+
+        if current_packet.len() + chunk_size > 1472 {
+            payloads.push((current_packet, current_metrics_count));
+            current_packet = Vec::with_capacity(1472);
+            current_metrics_count = 0;
         }
-        current_batch.push_str(&line);
+
+        current_packet.push(name_len as u8);
+        current_packet.extend_from_slice(name_bytes);
+        current_packet.extend_from_slice(&1.0f64.to_le_bytes());
+        current_packet.extend_from_slice(&ts.to_le_bytes());
+        
+        current_metrics_count += 1;
     }
-    if !current_batch.is_empty() {
-        payloads.push(current_batch.into_bytes());
+    if !current_packet.is_empty() {
+        payloads.push((current_packet, current_metrics_count));
     }
     let payloads = Arc::new(payloads);
 
@@ -99,6 +115,66 @@ fn main() {
     let packets_sent = Arc::new(AtomicU64::new(0));
     let metrics_sent = Arc::new(AtomicU64::new(0));
     let bytes_sent = Arc::new(AtomicU64::new(0));
+
+    // Spawn background SQL monitoring thread
+    // Runs query: SELECT SUM(value::float8) FROM evt_secs every 60 seconds
+    // Executes 5 times: 3 times during the run, 2 times after
+    let query_thread = thread::spawn(move || {
+        for run in 1..=5 {
+            thread::sleep(Duration::from_secs(60));
+            
+            let start = Instant::now();
+            let output = std::process::Command::new("docker")
+                .args(&[
+                    "exec",
+                    "stat-pg-db",
+                    "psql",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "postgres",
+                    "-t",
+                    "-c",
+                    "SELECT COALESCE(SUM(value::float8), 0.0) FROM evt_secs;",
+                ])
+                .output();
+            
+            let duration = start.elapsed();
+            
+            println!("\n--------------------------------------------------");
+            print!("SQL Monitor Run {}/5 | ", run);
+            match output {
+                Ok(out) => {
+                    if out.status.success() {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let sum_val: f64 = stdout.trim().parse().unwrap_or(0.0);
+                        
+                        fn format_number(val: u64) -> String {
+                            let s = val.to_string();
+                            let mut result = String::new();
+                            let mut chars = s.chars().rev().enumerate();
+                            while let Some((idx, c)) = chars.next() {
+                                if idx > 0 && idx % 3 == 0 {
+                                    result.push(',');
+                                }
+                                result.push(c);
+                            }
+                            result.chars().rev().collect()
+                        }
+                        
+                        println!("SUM(value): {} (Query took {:.2?})", format_number(sum_val as u64), duration);
+                    } else {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        println!("SQL Error: {} (took {:.2?})", stderr.trim(), duration);
+                    }
+                }
+                Err(e) => {
+                    println!("Failed to run docker exec: {} (took {:.2?})", e, duration);
+                }
+            }
+            println!("--------------------------------------------------");
+        }
+    });
 
     let start_time = Instant::now();
     let mut worker_handles = Vec::with_capacity(threads);
@@ -113,7 +189,6 @@ fn main() {
         let target = target_addr.clone();
 
         let handle = thread::spawn(move || {
-            // Bind thread socket to an ephemeral port
             let socket = UdpSocket::bind("0.0.0.0:0")
                 .expect("Failed to bind thread UDP socket");
             
@@ -123,20 +198,16 @@ fn main() {
             let mut batch_idx = thread_id as usize;
 
             while running_clone.load(Ordering::Relaxed) {
-                let payload = &payloads_clone[batch_idx % payloads_clone.len()];
+                let (payload, metrics_in_batch) = &payloads_clone[batch_idx % payloads_clone.len()];
                 
-                // Blast UDP packet
                 if let Ok(bytes) = socket.send_to(payload, &target) {
                     local_packets += 1;
-                    // Count number of newlines to determine actual metrics sent in this batch
-                    let metrics_in_batch = payload.iter().filter(|&&b| b == b'\n').count() as u64;
                     local_metrics += metrics_in_batch;
                     local_bytes += bytes as u64;
                 }
 
                 batch_idx = batch_idx.wrapping_add(threads);
 
-                // Batch flush atomic updates periodically to minimize atomic contention
                 if local_packets % 1000 == 0 {
                     packets_clone.fetch_add(local_packets, Ordering::Relaxed);
                     metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
@@ -147,7 +218,6 @@ fn main() {
                 }
             }
 
-            // Flush remaining counts
             packets_clone.fetch_add(local_packets, Ordering::Relaxed);
             metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
             bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
@@ -158,7 +228,7 @@ fn main() {
 
     println!("Blasting UDP packets to target server...");
 
-    // Wait for the duration of the benchmark
+    // Wait for the duration of the benchmark (180 seconds)
     thread::sleep(Duration::from_secs(duration_secs as u64));
 
     // Signal all workers to stop
@@ -175,7 +245,7 @@ fn main() {
     let total_bytes = bytes_sent.load(Ordering::SeqCst);
 
     let pps = total_packets as f64 / elapsed.as_secs_f64();
-    let mps = total_metrics as f64 / elapsed.as_secs_f64();
+    let mps = total_metrics as u64 / elapsed.as_secs();
     let mb_sec = (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64();
 
     fn format_number(val: u64) -> String {
@@ -204,7 +274,12 @@ fn main() {
     println!("Total Metrics  : {}", format_number(total_metrics));
     println!("Total Bytes    : {:.2} MB", total_bytes as f64 / 1_048_576.0);
     println!("Average PPS    : {} Packets/sec", format_float(pps));
-    println!("Average MPS    : {} Metrics/sec (Ingested)", format_float(mps));
+    println!("Average MPS    : {} Metrics/sec (Ingested)", format_number(mps));
     println!("Throughput     : {:.2} MB/sec", mb_sec);
+    println!("==================================================");
+
+    // Wait for the SQL background monitoring thread to complete its remaining runs (up to 300 seconds total)
+    println!("Waiting for final background SQL query runs to finish...");
+    let _ = query_thread.join();
     println!("==================================================");
 }

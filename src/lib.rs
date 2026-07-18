@@ -9,7 +9,7 @@ use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use std::thread;
 
 pgrx::pg_module_magic!();
@@ -151,7 +151,7 @@ impl MetricCache {
         // days
         let day_ts = ts / 86400;
         self.days.entry((code.clone(), day_ts)).and_modify(|e| *e += val).or_insert(val);
-        // 30-days (corrected interval to 2592000 seconds)
+        // 30-days
         let day30_ts = ts / 2592000;
         self.days30.entry((code, day30_ts)).and_modify(|e| *e += val).or_insert(val);
     }
@@ -161,38 +161,44 @@ impl MetricCache {
     }
 }
 
-fn parse_packet(payload: &str, pool: &mut HashSet<Arc<str>>) -> Option<Metric> {
-    let mut parts = payload.split_whitespace();
-    let code_str = parts.next()?;
-    
-    // Limit maximum code name length to 64
-    if code_str.len() > 64 {
-        return None;
+fn parse_variable_binary(
+    packet: &[u8],
+    pool: &mut HashSet<Arc<str>>,
+    cache: &mut MetricCache,
+    processed_metrics: &mut usize,
+) {
+    let mut offset = 0;
+    while offset + 17 <= packet.len() {
+        let name_len = packet[offset] as usize;
+        if offset + 1 + name_len + 16 > packet.len() {
+            break; // Partial metric or malformed buffer chunk
+        }
+
+        let name_bytes = &packet[offset + 1 .. offset + 1 + name_len];
+        if let Ok(code_str) = std::str::from_utf8(name_bytes) {
+            let val_offset = offset + 1 + name_len;
+            if let (Some(val_bytes), Some(ts_bytes)) = (
+                packet.get(val_offset .. val_offset + 8),
+                packet.get(val_offset + 8 .. val_offset + 16)
+            ) {
+                let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
+                let at = i64::from_le_bytes(ts_bytes.try_into().unwrap());
+
+                // Interning lookup: get reference-counted slice
+                let code = if let Some(interned) = pool.get(code_str) {
+                    interned.clone()
+                } else {
+                    let interned: Arc<str> = Arc::from(code_str);
+                    pool.insert(interned.clone());
+                    interned
+                };
+
+                cache.add(Metric { code, value, at });
+                *processed_metrics += 1;
+            }
+        }
+        offset += 1 + name_len + 16;
     }
-
-    let value_str = parts.next()?;
-    let value: f64 = value_str.parse().ok()?;
-    
-    // timestamp is optional; fallback to current time
-    let at = if let Some(ts_str) = parts.next() {
-        ts_str.parse::<i64>().ok()?
-    } else {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_secs() as i64
-    };
-    
-    // String interning logic: reuse existing Arc<str> if present in the local pool
-    let code = if let Some(interned) = pool.get(code_str) {
-        interned.clone()
-    } else {
-        let interned: Arc<str> = Arc::from(code_str);
-        pool.insert(interned.clone());
-        interned
-    };
-
-    Some(Metric { code, value, at })
 }
 
 #[pg_guard]
@@ -233,32 +239,26 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
 
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
-    let (tx, rx): (Sender<Metric>, Receiver<Metric>) = channel();
+    let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel();
 
     // Spawn high-speed UDP receiver thread
     // CRITICAL: We DO NOT call any pg_sys/pgrx functions (like worker_continue() or log!)
     // inside this spawned thread to prevent thread-local memory context segfaults.
     thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        // Initialize thread-local string interning pool to reuse Arc<str> refs
-        let mut intern_pool = HashSet::new();
+        let mut buf = [0u8; 65536];
 
         while running_clone.load(Ordering::Relaxed) {
             match socket.recv_from(&mut buf) {
                 Ok((amt, _src)) => {
-                    if let Ok(payload) = std::str::from_utf8(&buf[..amt]) {
-                        for line in payload.lines() {
-                            if let Some(metric) = parse_packet(line.trim(), &mut intern_pool) {
-                                let _ = tx.send(metric);
-                            }
-                        }
-                    }
+                    let mut vec = vec![0u8; amt];
+                    vec.copy_from_slice(&buf[..amt]);
+                    let _ = tx.send(vec);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Timeout reached, loop again to check running state
                 }
                 Err(_e) => {
-                    // Ignored receiver error to avoid calling pg_sys logging inside a thread
+                    // Ignored receiver error
                 }
             }
         }
@@ -266,14 +266,14 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
 
     let mut cache = MetricCache::default();
     let mut last_flush = SystemTime::now();
+    let mut intern_pool = HashSet::new();
 
     while BackgroundWorker::worker_continue() {
-        // 1. Process metrics from the channel (up to 100,000 at a time to prevent flusher starvation)
-        let mut processed = 0;
-        while processed < 100_000 {
-            if let Ok(metric) = rx.try_recv() {
-                cache.add(metric);
-                processed += 1;
+        // 1. Process packet payloads from the channel (up to 100,000 metrics per iteration to prevent starvation)
+        let mut processed_metrics = 0;
+        while processed_metrics < 100_000 {
+            if let Ok(packet_bytes) = rx.try_recv() {
+                parse_variable_binary(&packet_bytes, &mut intern_pool, &mut cache, &mut processed_metrics);
             } else {
                 break;
             }
@@ -345,44 +345,47 @@ mod unit_tests {
     use super::*;
 
     #[test]
-    fn test_parse_packet_valid() {
+    fn test_parse_variable_binary_valid() {
         let mut pool = HashSet::new();
-        let parsed = parse_packet("api.request 5.5 1721237340", &mut pool);
-        assert!(parsed.is_some());
-        let m = parsed.unwrap();
-        assert_eq!(m.code.as_ref(), "api.request");
-        assert_eq!(m.value, 5.5);
-        assert_eq!(m.at, 1721237340);
+        let mut cache = MetricCache::default();
+        let mut processed = 0;
+
+        // Build a packet with two metrics
+        let mut packet = Vec::new();
+
+        // Metric 1: "api.req" (7 chars), value 5.5, ts 1000
+        packet.push(7u8);
+        packet.extend_from_slice(b"api.req");
+        packet.extend_from_slice(&5.5f64.to_le_bytes());
+        packet.extend_from_slice(&1000i64.to_le_bytes());
+
+        // Metric 2: "db.query" (8 chars), value 10.2, ts 2000
+        packet.push(8u8);
+        packet.extend_from_slice(b"db.query");
+        packet.extend_from_slice(&10.2f64.to_le_bytes());
+        packet.extend_from_slice(&2000i64.to_le_bytes());
+
+        parse_variable_binary(&packet, &mut pool, &mut cache, &mut processed);
+
+        assert_eq!(processed, 2);
+        assert_eq!(*cache.secs.get(&(Arc::from("api.req"), 1000)).unwrap(), 5.5);
+        assert_eq!(*cache.secs.get(&(Arc::from("db.query"), 2000)).unwrap(), 10.2);
     }
 
     #[test]
-    fn test_parse_packet_optional_ts() {
+    fn test_parse_variable_binary_malformed() {
         let mut pool = HashSet::new();
-        let parsed = parse_packet("api.request 10", &mut pool);
-        assert!(parsed.is_some());
-        let m = parsed.unwrap();
-        assert_eq!(m.code.as_ref(), "api.request");
-        assert_eq!(m.value, 10.0);
-        assert!(m.at > 0);
-    }
+        let mut cache = MetricCache::default();
+        let mut processed = 0;
 
-    #[test]
-    fn test_parse_packet_invalid() {
-        let mut pool = HashSet::new();
-        assert!(parse_packet("malformed_input", &mut pool).is_none());
-        assert!(parse_packet("api.request abc", &mut pool).is_none());
-    }
+        // Build a partial metric
+        let mut packet = Vec::new();
+        packet.push(5u8);
+        packet.extend_from_slice(b"short"); // missing value and ts
 
-    #[test]
-    fn test_parse_packet_length_limit() {
-        let mut pool = HashSet::new();
-        // 64-char string is valid
-        let valid_code = "a".repeat(64);
-        assert!(parse_packet(&format!("{} 1", valid_code), &mut pool).is_some());
-
-        // 65-char string is invalid
-        let invalid_code = "a".repeat(65);
-        assert!(parse_packet(&format!("{} 1", invalid_code), &mut pool).is_none());
+        parse_variable_binary(&packet, &mut pool, &mut cache, &mut processed);
+        assert_eq!(processed, 0);
+        assert!(cache.is_empty());
     }
 }
 
