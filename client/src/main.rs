@@ -50,6 +50,46 @@ fn register_metric(db_url: &str, name: &str) -> Result<i32, String> {
     Ok(id)
 }
 
+fn parse_statsd_line(line: &str) -> Option<(String, f64)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    // Parse format: name:value|type
+    let parts: Vec<&str> = line.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let name = parts[0].trim().to_string();
+    let rest = parts[1];
+    let val_type: Vec<&str> = rest.split('|').collect();
+    if val_type.is_empty() {
+        return None;
+    }
+
+    let val: f64 = match val_type[0].trim().parse() {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+
+    let metric_type = if val_type.len() >= 2 {
+        val_type[1].trim()
+    } else {
+        "c" // default to counter
+    };
+
+    // Timers/ms get converted to counter with `_ms` suffix
+    let final_name = if metric_type == "ms" {
+        format!("{}_ms", name)
+    } else {
+        name
+    };
+
+    Some((final_name, val))
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -118,44 +158,10 @@ fn main() {
 
                     // StatsD packets can contain multiple metrics separated by newlines
                     for line in data_str.lines() {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
+                        if let Some((name, val)) = parse_statsd_line(line) {
+                            let entry = aggs.entry(name).or_insert(0.0);
+                            *entry += val;
                         }
-
-                        // Parse format: name:value|type
-                        let parts: Vec<&str> = line.split(':').collect();
-                        if parts.len() != 2 {
-                            continue;
-                        }
-
-                        let name = parts[0].trim().to_string();
-                        let rest = parts[1];
-                        let val_type: Vec<&str> = rest.split('|').collect();
-                        if val_type.is_empty() {
-                            continue;
-                        }
-
-                        let val: f64 = match val_type[0].trim().parse() {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-
-                        let metric_type = if val_type.len() >= 2 {
-                            val_type[1].trim()
-                        } else {
-                            "c" // default to counter
-                        };
-
-                        // Timers/ms get converted to counter with `_ms` suffix
-                        let final_name = if metric_type == "ms" {
-                            format!("{}_ms", name)
-                        } else {
-                            name
-                        };
-
-                        let entry = aggs.entry(final_name).or_insert(0.0);
-                        *entry += val;
                     }
                 }
                 Err(e) => {
@@ -229,5 +235,27 @@ fn main() {
         if !payload.is_empty() {
             let _ = server_socket.send_to(&payload, &server_addr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_statsd_line() {
+        assert_eq!(
+            parse_statsd_line("foo:10.5|c"),
+            Some(("foo".to_string(), 10.5))
+        );
+        assert_eq!(
+            parse_statsd_line("bar:250|ms"),
+            Some(("bar_ms".to_string(), 250.0))
+        );
+        assert_eq!(
+            parse_statsd_line("baz:42"),
+            Some(("baz".to_string(), 42.0))
+        );
+        assert_eq!(parse_statsd_line("invalid_line"), None);
     }
 }

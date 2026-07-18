@@ -435,6 +435,18 @@ mod tests {
 }
 
 #[cfg(test)]
+mod unit_tests {
+    #[test]
+    fn test_make_batch_insert_query() {
+        let query = crate::make_batch_insert_query("evt_secs", 2);
+        assert_eq!(
+            query,
+            "INSERT INTO evt_secs (metric_id, at, value) VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_secs.value + EXCLUDED.value;"
+        );
+    }
+}
+
+#[cfg(test)]
 pub mod pg_test {
     pub fn setup(_options: Vec<&str>) {}
 
