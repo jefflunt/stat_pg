@@ -279,6 +279,15 @@ fn main() {
         }
     }
 
+    // Pre-cache all registered metric IDs to avoid formatting and hashmap lookups in the hot loop
+    let mut metric_ids = Vec::with_capacity(unique_metrics as usize);
+    for idx in 0..unique_metrics {
+        let name = format!("bench.metric.{}", idx);
+        let id = *name_to_id.get(&name).expect("Registered metric not found");
+        metric_ids.push(id);
+    }
+    let metric_ids = Arc::new(metric_ids);
+
     let start_time = Instant::now();
     let mut worker_handles = Vec::with_capacity(threads as usize);
 
@@ -289,7 +298,7 @@ fn main() {
         let metrics_clone = metrics_sent.clone();
         let bytes_clone = bytes_sent.clone();
         let target = target_addr.clone();
-        let name_to_id_clone = name_to_id.clone();
+        let metric_ids_clone = metric_ids.clone();
 
         let handle = thread::spawn(move || {
             let socket = match UdpSocket::bind("0.0.0.0:0") {
@@ -319,8 +328,7 @@ fn main() {
                 let mut metrics_in_batch = 0;
                 for _ in 0..100 {
                     let metric_idx = batch_idx % unique_metrics as usize;
-                    let metric_name = format!("bench.metric.{}", metric_idx);
-                    let &metric_id = name_to_id_clone.get(&metric_name).unwrap();
+                    let metric_id = metric_ids_clone[metric_idx];
 
                     write_buf.extend_from_slice(&metric_id.to_le_bytes());
                     write_buf.extend_from_slice(&1.0f64.to_le_bytes());
