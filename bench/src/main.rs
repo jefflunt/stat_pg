@@ -264,6 +264,14 @@ fn main() {
     println!("Warmup: Waiting 2.0 seconds for background worker to sync MAX(id) bounds...");
     std::thread::sleep(Duration::from_secs(2));
 
+    // Verify registration count in the database
+    if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
+        if let Ok(row) = client.query_one("SELECT COUNT(*) FROM stat_pg_metrics;", &[]) {
+            let count: i64 = row.get(0);
+            println!("Warmup check: Total registered metrics in database: {}", count);
+        }
+    }
+
     let start_time = Instant::now();
     let mut worker_handles = Vec::with_capacity(threads as usize);
 
