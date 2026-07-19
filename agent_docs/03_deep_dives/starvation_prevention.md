@@ -1,57 +1,65 @@
-# Starvation Prevention & Queue Management
+# Starvation Prevention & Socket Queue Management
 
-Under extreme ingestion loads (e.g., millions of metrics per second), background workers can experience loop starvation. This deep dive explains why starvation occurs and how `stat-pg` prevents it.
+Under extreme ingestion loads (e.g., millions of metrics per second), network ingestion processes can experience queue starvation or packet loss. This deep dive explains why starvation occurs and how `stat-pg` prevents it.
 
 ---
 
-## The Starvation Scenario
+## The Starvation Scenario (TCP Stream Queue Ingestion)
 
-In our multi-threaded architecture, client connection threads parse TCP messages and drop aggregated values into a channel (`std::sync::mpsc::channel`).
-The main worker thread drains this channel in a loop:
+In the legacy TCP-based architecture, client connection threads parsed incoming TCP streams and dropped metric updates into a single SPSC ring buffer. The main worker thread was responsible for draining this channel in a loop:
 
 ```rust
-// Legacy implementation (Vulnerable to starvation)
+// Legacy implementation (Vulnerable to starvation and OOM)
 while let Ok(metric) = rx.try_recv() {
     cache.add(metric);
 }
 ```
 
 ### The Infinite Loop Vulnerability
-* If incoming metric rates are extremely high (e.g., 10M metrics/sec), the channel will accumulate items faster than the main thread can execute loop iterations.
-* Because the channel is never empty, `rx.try_recv()` will continuously return `Ok(...)`.
-* The thread becomes **trapped** inside the drainage loop indefinitely.
-* Because it never exits the drainage loop, it never reaches the periodic flush logic:
-  ```rust
-  if elapsed.as_secs_f64() >= flush_sec {
-      // Never reached!
-  }
-  ```
-* **Consequences**: No data is written to the database (0 rows inserted), and memory usage spikes continuously as the cache grows without bound, ultimately causing an Out-Of-Memory (OOM) crash.
+* If incoming metric rates were extremely high, the channel accumulated items faster than the main thread could execute loop iterations.
+* Because the channel was never empty, the thread became **trapped** inside the drainage loop.
+* Because it never exited the drainage loop, it never reached the periodic database flush logic, growing the cache without bound and crashing with an Out-of-Memory (OOM) error.
 
 ---
 
-## The Solution: Capped Channel Drainage
+## The Solution: Decoupled In-Memory Aggregation & Non-Blocking Socket Draining
 
-To ensure the flusher regularly yields and executes transaction commits, we enforce a **fairness cap** on how many metrics can be pulled from the queue per iteration:
+To solve this, `stat-pg` decouples network buffer consumption from database transactions.
 
-```rust
-// Starvation-resistant implementation
-while s.metrics_processed < 500_000 {
-    if let Ok((metric_id, value, at)) = s.metric_rx.pop() {
-        s.sliding_window.add(metric_id as usize, value, at, client)?;
-        s.metrics_processed += 1;
-    } else {
-        break;
-    }
-}
+```
+Incoming Network Blasts
+       │
+       ▼ (120 updates per UDP packet)
+┌──────────────────────────────────────┐
+│  Linux Socket Buffer (256MB tuned)   │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼ (1. blocking recvmmsg batch retrieval)
+┌──────────────────────────────────────┐
+│       UDP Listener Thread            │◄───┐
+│  Decodes 2-byte variable payloads    │    │ (2. non-blocking recv_batch_nonblocking loop)
+│  Updates Mutex-locked active_buffer  ├────┘
+└──────────────────────────────────────┘
+                   ▲
+                   │ (3. fast reference swap every 1.0 second)
+┌──────────────────┴───────────────────┐
+│         Main SPI Thread              │
+│  Runs SQL COPY of swapped buffer     │
+│  Latching sleep (50ms duration)      │
+└──────────────────────────────────────┘
 ```
 
-### How it Works
-1. **The Drainage Cap**: The loop pulls at most `500,000` items from the SPSC ring buffer.
-2. **Exiting and Checking**: Once `metrics_processed` reaches `500,000`, the loop terminates. The thread proceeds immediately to the next steps:
-    - Checks the flush timer.
-    - Flushes aggregated metrics to PostgreSQL tables if `flush_interval` has passed.
-    - Yields CPU execution to the operating system using `BackgroundWorker::wait_latch(Some(sleep_dur))` to let PostgreSQL handle internal interrupts and checkpoints.
-3. **Looping**: On the next loop tick, the worker resumes draining the remaining queued channel items.
+### 1. Multi-Threaded In-Memory Decoupling
+Because metrics are parsed and aggregated *in-memory* directly by the spawned UDP thread into a shared `active_buffer` (`Mutex<Vec<f64>>`), the main PostgreSQL thread is completely freed from channel draining:
+* The UDP thread updates the active buffer hot-path under a mutex lock.
+* The main thread only acquires the mutex once per `flush_interval` (default `1.0s`) to swap the buffer vector with a local flush buffer.
+* The swap operation is near-instantaneous ($O(1)$ pointer swap), holding the lock for only a few microseconds. The UDP thread never experiences lock starvation.
 
-This threshold balances **high aggregate memory absorption** (so we drain the queue quickly) with **predictable write latency** (guaranteeing that SQL transactions commit on time).
+### 2. Double-Buffered `recvmmsg` Queue Drainage
+To prevent the OS socket buffer from overflowing and dropping UDP packets (which do not have flow control like TCP) under peak traffic bursts, the UDP thread implements a two-stage drainage process:
+* **Blocking Batch Retrieval**: The thread calls `recv_batch_blocking` using `recvmmsg` (on Linux) to retrieve up to `32` packets. This blocks and yields CPU when no traffic is present, preventing high idle CPU usage.
+* **Non-Blocking Hot Loop**: Once packets arrive, the thread processes them and immediately enters a tight inner loop calling `recv_batch_nonblocking` (`MSG_DONTWAIT` flag) to drain any other pending packets in the kernel's socket queue.
+* **Socket Buffer Tuning**: The UDP socket's receive buffer size is set to `256MB` (`SO_RCVBUF`). This acts as a massive shock absorber to hold backlogged packets while the UDP thread is processing updates.
+
+### 3. CPU Yielding via Latch Wait
+The main worker thread checks for shutdown and handles database flushes. Instead of spinning, it sleeps for 50ms intervals using `BackgroundWorker::wait_latch(Some(Duration::from_millis(50)))`. This yields CPU cycles to the host operating system and other PostgreSQL background processes, ensuring the database server remains responsive.

@@ -8,21 +8,33 @@
 
 ```mermaid
 graph TD
-    Client[Client Systems] -->|TCP Streams| Listener[TCP Port 8125]
+    Client[Client / Benchmark Systems] -->|UDP Packets on port 8125| OS[OS Socket Layer]
     
-    subgraph PostgreSQL Background Worker Process
-        Listener -->|accept| Connection["Client Stream Threads (Concurrent OS threads)"]
-        Connection -->|1. RegRequest Handshake| RegChannel[mpsc Reg Channel]
-        Connection -->|2. Stream 0x02 Packets| MetricChannel[rtrb SPSC Ring Buffer]
+    subgraph PostgreSQL Cluster Processes
+        OS -->|Load Balance via SO_REUSEPORT| Worker0["Background Worker 0 (Coordinator)"]
+        OS -->|Load Balance via SO_REUSEPORT| WorkerN["Background Worker N (Aggregator)"]
         
-        subgraph Main worker Thread (thread-local context)
-            RegChannel -->|register| SPI_Reg[SPI Registration Transaction]
-            SPI_Reg -->|insert/lookup| Cache[(shared name_to_id cache)]
+        subgraph Worker 0 (Coordinator)
+            Worker0 -->|spawn| UDP0[UDP Listener Thread]
+            UDP0 -->|recvmmsg batch| Socket0[UDP Socket]
+            Socket0 -->|Parse & Update| MutexBuf0["active_buffer (Mutex<Vec<f64>>)"]
             
-            MetricChannel -->|pop| QueueDrain[Queue Drainer]
-            QueueDrain -->|aggregate| SlidingWin[(SlidingWindow Circular Array)]
-            SlidingWin -->|periodic flush| Tx[PG Transaction Context]
-            Tx -->|SPI parameterized batch write| DB[(PostgreSQL Rollup Tables)]
+            Main0[Main SPI Thread] -->|1. Swap local buffer every 1.0s| MutexBuf0
+            Main0 -->|2. Write CSV| CSV0["File: /tmp/flush_pid0.csv"]
+            CSV0 -->|3. SQL COPY| Staging[(stat_pg_staging unlogged table)]
+            
+            Main0 -->|4. coordinator_merge| Staging
+            Staging -->|Aggregate & ORDER BY at, metric_id| EvtTables[(evt_secs, evt_mins, evt_hours, etc.)]
+        end
+
+        subgraph Worker N (Aggregator)
+            WorkerN -->|spawn| UDPN[UDP Listener Thread]
+            UDPN -->|recvmmsg batch| SocketN[UDP Socket]
+            SocketN -->|Parse & Update| MutexBufN["active_buffer (Mutex<Vec<f64>>)"]
+            
+            MainN[Main SPI Thread] -->|1. Swap local buffer every 1.0s| MutexBufN
+            MainN -->|2. Write CSV| CSVN["File: /tmp/flush_pidN.csv"]
+            CSVN -->|3. SQL COPY| Staging
         end
     end
 ```
@@ -31,25 +43,34 @@ graph TD
 
 ## Detailed Execution Components
 
-### 1. Decoupled Thread Architecture
-PostgreSQL is single-threaded and expects all backend C APIs to run on the main process thread. To avoid thread-local storage corruption and satisfy compile-time UnwindSafe bounds, `stat-pg` divides its work:
-* **Concurrent OS Stream Threads**: Binds a non-blocking TCP listener. For every incoming socket connection, it spawns a dedicated client reader thread. These threads read incoming buffers, execute name registration handshakes, and write parsed metric updates into a high-performance, lock-free SPSC ring buffer queue (`rtrb`).
-* **Main Backend Thread**: Drains the SPSC consumer, processes registration queries, aggregates metric values into the sliding aggregation window, checks the flush timer, and connects to Postgres database internals.
+### 1. Multi-Process Parallel Ingestion (`SO_REUSEPORT`)
+Postgres is historically single-threaded. To bypass single-core CPU throughput constraints, `stat-pg` supports horizontal scaling across multiple background worker processes:
+* The number of workers is configured via the GUC setting `stat_pg.workers` (up to `16`, default `4`).
+* Each worker process runs `stat_pg_main` and binds a separate UDP socket to the same port (default `8125`) using the `SO_REUSEPORT` socket option.
+* The Linux kernel automatically load-balances incoming UDP packets at the socket layer across these worker sockets, scaling ingestion linearly with available CPU cores.
 
-### 2. In-Memory Aggregation (SlidingWindow)
-Instead of executing a database write for every incoming packet, metrics are aggregated in-memory:
-* Metrics are aggregated across a circular buffer array of size `buffer_window` (default `5` seconds).
-* Slots in the array are directly indexed using `timestamp % window_size`, providing $O(1)$ constant-time lookup and aggregate updates without hash collisions.
-* Metrics are flushed to five granularity resolutions: second (`evt_secs`), minute (`evt_mins`), hour (`evt_hours`), day (`evt_days`), and 30-day (`evt_30s`).
+### 2. Decoupled Thread Architecture & Double Buffering
+Within each background worker process, execution is split into two parts to prevent blocking the network receiver during database writes:
+* **UDP Listener Thread**: Spawns a dedicated OS thread that receives UDP packets. It decodes the custom binary payload and updates the shared `active_buffer` (`Mutex<Vec<f64>>`) directly. It validates that the parsed metric ID is within the atomic bounds of `max_valid_id` to avoid out-of-bounds errors.
+* **Main SPI Thread**: Runs the main loop of the PostgreSQL background worker. Every `flush_interval` (default `1.0` seconds), it swaps the `active_buffer` with its own `local_flush_buffer` inside a brief mutex lock. The UDP thread is freed immediately to continue packet consumption while the main thread writes the flushed metrics.
 
-### 3. Starvation Prevention
-Under peak fires of TCP traffic, the channels can fill up faster than the main thread can aggregate metrics. To prevent the flusher from getting stuck in the queue drainage loop indefinitely, the worker drains a maximum of `500,000` metrics per iteration before yielding to check the timer and run the flush.
+### 3. Linux `recvmmsg` Batching
+To minimize user-to-kernel context switching overhead:
+* Linux environments utilize the `recvmmsg` system call to retrieve batches of up to `32` packets in a single context switch.
+* After a blocking batch retrieval, a non-blocking loop drains the remaining queued socket buffers.
+* Non-Linux environments gracefully fall back to a standard blocking `recv_from` call.
 
-### 4. Transaction-Safe SPI Flush
-Every `1.0` seconds (configurable), the worker swaps the metrics cache and initiates a database transaction using:
-* Parameterized batch prepared statements (chunks of `5000`, `500`, `1`) to avoid SegFaults by aligning datums to exact OIDs (`INT4OID`, `INT8OID`, `FLOAT8OID`).
-* Upserts targeting integer foreign keys:
-  ```sql
-  INSERT INTO table (metric_id, at, value) VALUES ($1, $2, $3)
-  ON CONFLICT (at, metric_id) DO UPDATE SET value = table.value + EXCLUDED.value;
-  ```
+### 4. COPY-Based Staging Pipeline & Coordinator Merge
+Writing directly to target resolution tables under high load triggers high write amplification and transaction lock contention:
+* **COPY to Staging**: Each worker formats its `local_flush_buffer` as CSV and dumps it to `/tmp/flush_<pid>.csv`. It then executes a high-speed `COPY` statement to load the data into the unlogged `stat_pg_staging` table. Unlogged tables bypass PostgreSQL WAL logging, dramatically reducing disk I/O.
+* **Coordinator Merge**: Worker index `0` acts as the coordinator. In addition to staging its own data, it periodically:
+  1. Creates a temporary table `stat_pg_temp` by selecting all rows from `stat_pg_staging`.
+  2. Instantly runs `TRUNCATE stat_pg_staging` to release lock contention for other workers.
+  3. Inserts and aggregates metrics from `stat_pg_temp` into the final resolution tables (`evt_secs`, `evt_mins`, `evt_hours`, `evt_days`, `evt_30s`).
+  4. Drops `stat_pg_temp`.
+
+### 5. B-Tree Sequential Insertion Optimization
+When merging data from the temporary table, the queries use an `ORDER BY at, metric_id` clause. This ensures that the rows are inserted in sequential order. In PostgreSQL, inserting sorted data into B-Tree primary key indexes (`(at, metric_id)`) avoids random page lookups, prevents page-split fragmentation, and maximizes write throughput.
+
+### 6. Sampling Profile (`pprof`)
+The workers register a `pprof` profile handler. Upon shutdown (SIGTERM), the worker outputs a CPU profile SVG flamegraph to `/workspace/flamegraph_<pid>.svg` to simplify diagnostics.

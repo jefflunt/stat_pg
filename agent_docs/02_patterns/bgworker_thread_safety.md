@@ -12,34 +12,42 @@ PostgreSQL is historically a single-threaded process architecture. It relies hea
 
 ---
 
-## The Pattern: Decoupled OS Socket & Database Threads
+## The Pattern: Decoupled UDP Listener & Main Database Threads
 
-To leverage multi-core concurrency (e.g., to handle high-speed TCP streaming sockets without blocking on database writes), you must decouple network reading from database writing.
+To leverage multi-core concurrency (handling high-speed UDP ingestion sockets without blocking on database writes), you must decouple network packet reading from database writing.
 
 ```
-[Spawned Client Threads (OS)]      [SPSC Ring Buffer]        [Main Thread (PG)]
-  Read TCP Stream                    reg_tx.send()             reg_rx.try_recv()
-  Parse Handshake Handshake     =======================>       SPI name registration
-  Parse 0x02 Updates                 metric_tx.push()          metric_rx.pop()
-  (Pure Rust StdLib)            =======================>       SlidingWindow aggregate
-                                                               SPI parameterized upserts
+[Spawned UDP Thread (OS)]           [Shared Buffer]         [Main Thread (PG)]
+  Read UDP socket (recvmmsg)                                  Check GUC parameters
+  Parse variable payload                                      Periodically (1.0s):
+  Check atomic max_valid_id   =======================>          Mutex buffer swap
+  Mutex-locked updates             active_buffer                CSV export & COPY
+  (Pure Rust StdLib)            (Mutex<Vec<f64>>)               coordinator_merge
+                                                                SPI table inserts
 ```
 
-### 1. The OS Thread constraint
-All spawned threads (both the listener thread and connection stream worker threads) must remain a **pure Rust execution environment**:
-* They can bind sockets, accept connections, read stream buffers, and perform string parsing/allocations.
+### 1. The OS Thread Constraint (Pure Rust Execution)
+All spawned threads (the UDP listener socket receiver and parser threads) must remain in a **pure Rust execution environment**:
+* They can bind sockets, accept data, read buffer arrays, and perform memory updates.
 * **CRITICAL**: Spawned threads must never call `pgrx::log!`, `BackgroundWorker::worker_continue()`, or execute any SPI/FFI functions.
-* **FFI Warning**: Calling `pgrx::log!` from a spawned thread will cause a panic with: `postgres FFI may not be called from multiple threads`. Use standard Rust `println!` or `eprintln!` instead, which safely redirects to stderr/Postgres logs.
+* **FFI Warning**: Calling `pgrx::log!` from a spawned thread will cause a panic: `postgres FFI may not be called from multiple threads`. Use standard Rust `eprintln!` or `println!` instead, which safely redirects to stderr and is output to PostgreSQL server logs.
 
-### 2. Coordination via queues and atomics
-* Use a high-performance, lock-free SPSC queue (`rtrb`) for metrics to prevent multi-producer atomic write contention.
-* Store the SPSC Producer in a shared `Arc<Mutex<Option<Producer>>>` container. Connection streams take the producer at connection start and return it at connection end, enabling seamless reconnects without hot path locking.
-* Use `Arc<AtomicBool>` to signal the threads when the BGWorker process is terminating, allowing them to cleanly exit their loops.
+### 2. Coordination via Mutex-Double Buffering
+* Instead of lock-free channel queues, the UDP listener thread and the main worker thread share `active_buffer` (`Arc<Mutex<Vec<f64>>>`) to aggregate values in-memory.
+* Every `flush_interval` (default 1s), the main thread enters a brief lock block, swaps the `active_buffer` with a blank `local_flush_buffer` vector, and exits the lock. This minimizes lock contention, allowing the UDP thread to resume updates immediately.
 
-### 3. SPI Connection boundaries
-The main thread alone manages connections to Postgres database internals:
+### 3. Memory Access and Atomic Safety Boundaries
+* For maximum performance in the UDP hot loop, metric updates in the `active_buffer` vector are done using `get_unchecked_mut`.
+* **Index Out-of-Bounds prevention**: To prevent memory corruption or segmentation faults from out-of-bound writes:
+  - The UDP thread reads an atomic `max_valid_id: Arc<AtomicI32>` value.
+  - It only applies updates if `id > 0 && id <= max_valid_id && id < active_buffer.len()`.
+  - The main thread updates `max_valid_id` during its periodic SPI flush sequence after querying the database to find the new maximum ID in `stat_pg_metrics`.
+  - If the database maximum ID increases, the main thread resizes both the active and local buffers before storing the new value in `max_valid_id`.
+
+### 4. SPI Connection Boundaries
+The main thread alone manages connections to PostgreSQL database internals:
 * Call `BackgroundWorker::connect_worker_to_spi` from the main thread.
-* Drain the channels in the main loop, run registrations, and perform memory aggregation.
+* Only the main thread initiates transactions, writes staging tables, and runs merge/rollup queries.
 * Wrap all SPI updates in a proper transaction context:
   ```rust
   BackgroundWorker::transaction(|| {
@@ -48,8 +56,3 @@ The main thread alone manages connections to Postgres database internals:
       })
   });
   ```
-
-### 4. Unwind Safety in Rust 2021
-* The SPSC consumer (`Consumer`) contains interior mutability (`UnsafeCell`) and is not `UnwindSafe` / `RefUnwindSafe` by default.
-* In the Rust 2021 edition, closures capture individual fields. Passing references to fields of a non-unwind-safe struct causes compiler failures on `BackgroundWorker::transaction(|| ...)` closures.
-* To bypass this, wrap raw worker pointers in a manual `UnwindSafe` / `RefUnwindSafe` newtype (`SafeWorkerStatePtr`) and invoke methods on it directly to force Rust to capture the wrapper itself rather than its inner raw fields.
