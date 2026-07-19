@@ -18,7 +18,7 @@ fn print_help() {
     );
 }
 
-fn register_metric(db_url: &str, name: &str) -> Result<i32, String> {
+fn register_metric(db_url: &str, name: &str, metric_type: &str) -> Result<i32, String> {
     let mut client = Client::connect(db_url, NoTls)
         .map_err(|e| format!("Failed to connect to database: {}", e))?;
 
@@ -29,7 +29,7 @@ fn register_metric(db_url: &str, name: &str) -> Result<i32, String> {
         .map_err(|e| format!("Failed to lock table: {}", e))?;
 
     let row = transaction.query_one(
-        "INSERT INTO stat_pg_metrics (id, name)
+        "INSERT INTO stat_pg_metrics (id, name, type)
          VALUES (
              (SELECT COALESCE(MIN(unused.id), 1)
               FROM (
@@ -38,11 +38,12 @@ fn register_metric(db_url: &str, name: &str) -> Result<i32, String> {
                   SELECT id + 1 FROM stat_pg_metrics
               ) unused
               WHERE unused.id NOT IN (SELECT id FROM stat_pg_metrics)),
-             $1
+             $1,
+             $2
          )
-         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name, type = EXCLUDED.type
          RETURNING id;",
-        &[&name],
+        &[&name, &metric_type],
     ).map_err(|e| format!("Failed to register metric: {}", e))?;
 
     let id: i32 = row.get(0);
@@ -50,7 +51,7 @@ fn register_metric(db_url: &str, name: &str) -> Result<i32, String> {
     Ok(id)
 }
 
-fn parse_statsd_line(line: &str) -> Option<(String, f64)> {
+fn parse_statsd_line(line: &str) -> Option<(String, f64, String)> {
     let line = line.trim();
     if line.is_empty() {
         return None;
@@ -80,6 +81,8 @@ fn parse_statsd_line(line: &str) -> Option<(String, f64)> {
         "c" // default to counter
     };
 
+    let is_currency = metric_type == "curr" || metric_type == "currency";
+
     // Timers/ms get converted to counter with `_ms` suffix
     let final_name = if metric_type == "ms" {
         format!("{}_ms", name)
@@ -87,7 +90,9 @@ fn parse_statsd_line(line: &str) -> Option<(String, f64)> {
         name
     };
 
-    Some((final_name, val))
+    let type_str = if is_currency { "currency" } else { "numeric" };
+
+    Some((final_name, val, type_str.to_string()))
 }
 
 fn main() {
@@ -133,6 +138,7 @@ fn main() {
     // In-memory aggregates and registration cache
     let aggregates = Arc::new(Mutex::new(HashMap::<String, f64>::new()));
     let cache = Arc::new(Mutex::new(HashMap::<String, i32>::new()));
+    let metric_types = Arc::new(Mutex::new(HashMap::<String, String>::new()));
 
     // Spawn UDP listener thread to ingest StatsD text format
     let listen_socket = match UdpSocket::bind(&listen_addr) {
@@ -144,6 +150,7 @@ fn main() {
     };
 
     let aggregates_clone = aggregates.clone();
+    let metric_types_clone = metric_types.clone();
     thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
         loop {
@@ -155,12 +162,14 @@ fn main() {
                     };
 
                     let mut aggs = aggregates_clone.lock().unwrap();
+                    let mut types = metric_types_clone.lock().unwrap();
 
                     // StatsD packets can contain multiple metrics separated by newlines
                     for line in data_str.lines() {
-                        if let Some((name, val)) = parse_statsd_line(line) {
-                            let entry = aggs.entry(name).or_insert(0.0);
+                        if let Some((name, val, mtype)) = parse_statsd_line(line) {
+                            let entry = aggs.entry(name.clone()).or_insert(0.0);
                             *entry += val;
+                            types.entry(name).or_insert(mtype);
                         }
                     }
                 }
@@ -203,14 +212,19 @@ fn main() {
                 cache_guard.get(&name).cloned()
             };
 
+            let mtype = {
+                let types_guard = metric_types.lock().unwrap();
+                types_guard.get(&name).cloned().unwrap_or_else(|| "numeric".to_string())
+            };
+
             if cached_id.is_none() {
                 // Perform database lookup/registration
-                match register_metric(&db_url, &name) {
+                match register_metric(&db_url, &name, &mtype) {
                     Ok(id) => {
                         let mut cache_guard = cache.lock().unwrap();
                         cache_guard.insert(name.clone(), id);
                         cached_id = Some(id);
-                        println!("Registered new metric name '{}' -> ID {}", name, id);
+                        println!("Registered new metric name '{}' (type: {}) -> ID {}", name, mtype, id);
                     }
                     Err(e) => {
                         eprintln!("Error registering metric '{}': {}", name, e);
@@ -220,9 +234,69 @@ fn main() {
             }
 
             if let Some(id) = cached_id {
-                // Packet format: [ID (4B LE i32)] [Value (8B LE f64)]
-                payload.extend_from_slice(&id.to_le_bytes());
-                payload.extend_from_slice(&val.to_le_bytes());
+                let id_i16 = id as i16;
+                let mut final_val = val;
+                if mtype == "currency" {
+                    final_val = val * 10000.0;
+                }
+
+                // Dynamically select the most compact format representation for final_val:
+                if final_val == 1.0 {
+                    payload.push(0); // FORMAT_INC
+                    payload.extend_from_slice(&id_i16.to_le_bytes());
+                } else if final_val == -1.0 {
+                    payload.push(1); // FORMAT_DEC
+                    payload.extend_from_slice(&id_i16.to_le_bytes());
+                } else if final_val.fract() == 0.0 {
+                    if final_val >= -128.0 && final_val <= 127.0 {
+                        payload.push(2); // FORMAT_INT8
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.push((final_val as i8) as u8);
+                    } else if final_val >= 0.0 && final_val <= 255.0 {
+                        payload.push(3); // FORMAT_UINT8
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.push(final_val as u8);
+                    } else if final_val >= -32768.0 && final_val <= 32767.0 {
+                        payload.push(4); // FORMAT_INT16
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.extend_from_slice(&(final_val as i16).to_le_bytes());
+                    } else if final_val >= 0.0 && final_val <= 65535.0 {
+                        payload.push(5); // FORMAT_UINT16
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.extend_from_slice(&(final_val as u16).to_le_bytes());
+                    } else if final_val >= i32::MIN as f64 && final_val <= i32::MAX as f64 {
+                        payload.push(8); // FORMAT_INT32
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.extend_from_slice(&(final_val as i32).to_le_bytes());
+                    } else if final_val >= u32::MIN as f64 && final_val <= u32::MAX as f64 {
+                        payload.push(9); // FORMAT_UINT32
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.extend_from_slice(&(final_val as u32).to_le_bytes());
+                    } else if final_val >= i64::MIN as f64 && final_val <= i64::MAX as f64 {
+                        payload.push(12); // FORMAT_INT64
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.extend_from_slice(&(final_val as i64).to_le_bytes());
+                    } else if final_val >= u64::MIN as f64 && final_val <= u64::MAX as f64 {
+                        payload.push(13); // FORMAT_UINT64
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.extend_from_slice(&(final_val as u64).to_le_bytes());
+                    } else {
+                        payload.push(14); // FORMAT_FLOAT64
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.extend_from_slice(&final_val.to_le_bytes());
+                    }
+                } else {
+                    let val_f32 = final_val as f32;
+                    if val_f32 as f64 == final_val {
+                        payload.push(10); // FORMAT_FLOAT32
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.extend_from_slice(&val_f32.to_le_bytes());
+                    } else {
+                        payload.push(14); // FORMAT_FLOAT64
+                        payload.extend_from_slice(&id_i16.to_le_bytes());
+                        payload.extend_from_slice(&final_val.to_le_bytes());
+                    }
+                }
 
                 // If payload is getting close to MTU (1,472 bytes for UDP), send it
                 if payload.len() >= 1440 {
@@ -246,15 +320,19 @@ mod tests {
     fn test_parse_statsd_line() {
         assert_eq!(
             parse_statsd_line("foo:10.5|c"),
-            Some(("foo".to_string(), 10.5))
+            Some(("foo".to_string(), 10.5, "numeric".to_string()))
         );
         assert_eq!(
             parse_statsd_line("bar:250|ms"),
-            Some(("bar_ms".to_string(), 250.0))
+            Some(("bar_ms".to_string(), 250.0, "numeric".to_string()))
         );
         assert_eq!(
             parse_statsd_line("baz:42"),
-            Some(("baz".to_string(), 42.0))
+            Some(("baz".to_string(), 42.0, "numeric".to_string()))
+        );
+        assert_eq!(
+            parse_statsd_line("payment:12.50|curr"),
+            Some(("payment".to_string(), 12.50, "currency".to_string()))
         );
         assert_eq!(parse_statsd_line("invalid_line"), None);
     }

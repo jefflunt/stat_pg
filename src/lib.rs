@@ -15,42 +15,47 @@ extension_sql!(
     r#"
     CREATE TABLE IF NOT EXISTS stat_pg_metrics (
         id SERIAL PRIMARY KEY,
-        name VARCHAR NOT NULL UNIQUE
+        name VARCHAR NOT NULL UNIQUE,
+        type VARCHAR NOT NULL DEFAULT 'numeric'
     );
     CREATE TABLE IF NOT EXISTS evt_secs (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
-        value DECIMAL(20, 12) NOT NULL,
+        value DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (at, metric_id)
     );
     CREATE TABLE IF NOT EXISTS evt_mins (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
-        value DECIMAL(20, 12) NOT NULL,
+        value DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (at, metric_id)
     );
     CREATE TABLE IF NOT EXISTS evt_hours (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
-        value DECIMAL(20, 12) NOT NULL,
+        value DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (at, metric_id)
     );
     CREATE TABLE IF NOT EXISTS evt_days (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
-        value DECIMAL(20, 12) NOT NULL,
+        value DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (at, metric_id)
     );
     CREATE TABLE IF NOT EXISTS evt_30s (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
-        value DECIMAL(20, 12) NOT NULL,
+        value DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (at, metric_id)
     );
     CREATE UNLOGGED TABLE IF NOT EXISTS stat_pg_staging (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
-        value DECIMAL(20, 12) NOT NULL
+        value DOUBLE PRECISION NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS stat_pg_processed (
+        worker_id INT PRIMARY KEY,
+        count BIGINT NOT NULL
     );
     "#,
     name = "create_evt_tables"
@@ -363,6 +368,134 @@ fn recv_batch_nonblocking(
     Ok(0)
 }
 
+fn f16_to_f64(bits: u16) -> f64 {
+    let sign = (bits >> 15) & 1;
+    let exp = (bits >> 10) & 0x1F;
+    let mant = bits & 0x3FF;
+
+    if exp == 0 {
+        if mant == 0 {
+            if sign == 1 { -0.0 } else { 0.0 }
+        } else {
+            let sign_multiplier = if sign == 1 { -1.0 } else { 1.0 };
+            sign_multiplier * (mant as f64) * 2.0f64.powi(-14 - 10)
+        }
+    } else if exp == 0x1F {
+        if mant == 0 {
+            if sign == 1 { f64::NEG_INFINITY } else { f64::INFINITY }
+        } else {
+            f64::NAN
+        }
+    } else {
+        let sign_multiplier = if sign == 1 { -1.0 } else { 1.0 };
+        sign_multiplier * ((1024 + mant) as f64) * 2.0f64.powi(exp as i32 - 15 - 10)
+    }
+}
+
+#[inline(always)]
+fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize {
+    let n = buf.len();
+    let mut offset = 0;
+    let mut parsed_count = 0;
+    while offset + 3 <= n {
+        let ptr = unsafe { buf.as_ptr().add(offset) };
+        let format = unsafe { *ptr };
+        let id = unsafe { std::ptr::read_unaligned(ptr.add(1) as *const i16) } as i32;
+
+        let value: f64;
+        let width: usize;
+
+        match format {
+            0 => {
+                value = 1.0;
+                width = 3;
+            }
+            1 => {
+                value = -1.0;
+                width = 3;
+            }
+            2 => {
+                if offset + 4 > n { break; }
+                let val = unsafe { *(ptr.add(3) as *const i8) };
+                value = val as f64;
+                width = 4;
+            }
+            3 => {
+                if offset + 4 > n { break; }
+                let val = unsafe { *(ptr.add(3) as *const u8) };
+                value = val as f64;
+                width = 4;
+            }
+            4 => {
+                if offset + 5 > n { break; }
+                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i16) };
+                value = val as f64;
+                width = 5;
+            }
+            5 => {
+                if offset + 5 > n { break; }
+                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u16) };
+                value = val as f64;
+                width = 5;
+            }
+            6 | 7 => {
+                if offset + 5 > n { break; }
+                let val_bits = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u16) };
+                value = f16_to_f64(val_bits);
+                width = 5;
+            }
+            8 => {
+                if offset + 7 > n { break; }
+                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i32) };
+                value = val as f64;
+                width = 7;
+            }
+            9 => {
+                if offset + 7 > n { break; }
+                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u32) };
+                value = val as f64;
+                width = 7;
+            }
+            10 | 11 => {
+                if offset + 7 > n { break; }
+                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const f32) };
+                value = val as f64;
+                width = 7;
+            }
+            12 => {
+                if offset + 11 > n { break; }
+                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i64) };
+                value = val as f64;
+                width = 11;
+            }
+            13 => {
+                if offset + 11 > n { break; }
+                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u64) };
+                value = val as f64;
+                width = 11;
+            }
+            14 | 15 => {
+                if offset + 11 > n { break; }
+                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const f64) };
+                value = val;
+                width = 11;
+            }
+            _ => {
+                break;
+            }
+        }
+
+        if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
+            unsafe {
+                *active.get_unchecked_mut(id as usize) += value;
+            }
+            parsed_count += 1;
+        }
+        offset += width;
+    }
+    parsed_count
+}
+
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
@@ -414,11 +547,13 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     let active_buffer = Arc::new(Mutex::new(vec![0.0; max_id as usize + 1]));
 
     let running = Arc::new(AtomicBool::new(true));
+    let metrics_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Spawn UDP listener thread
     let running_thread = running.clone();
     let active_buffer_clone = active_buffer.clone();
     let max_valid_id_clone = max_valid_id.clone();
+    let metrics_received_clone = metrics_received.clone();
 
     thread::spawn(move || {
         let socket_addr = format!("{}:{}", bind_addr, port);
@@ -486,39 +621,11 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                 Ok(count) if count > 0 => {
                     let mut active = active_buffer_clone.lock().unwrap();
                     let max_id = max_valid_id_clone.load(Ordering::Relaxed) as usize;
+                    let mut local_count = 0;
 
                     // Process the first batch
                     for i in 0..count {
-                        let n = lengths[i];
-                        let mut offset = 0;
-                        while offset + 6 <= n {
-                            let ptr = unsafe { bufs[i].as_ptr().add(offset) };
-                            let raw_id = unsafe { std::ptr::read_unaligned(ptr as *const i16) };
-                            if raw_id < 0 {
-                                // INT32 format (6 bytes total)
-                                let id = (raw_id & 0x7FFF) as i32;
-                                let value = unsafe { std::ptr::read_unaligned(ptr.add(2) as *const i32) } as f64;
-                                if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-                                    unsafe {
-                                        *active.get_unchecked_mut(id as usize) += value;
-                                    }
-                                }
-                                offset += 6;
-                            } else {
-                                // FLOAT64 format (10 bytes total)
-                                if offset + 10 > n {
-                                    break;
-                                }
-                                let id = raw_id as i32;
-                                let value = unsafe { std::ptr::read_unaligned(ptr.add(2) as *const f64) };
-                                if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-                                    unsafe {
-                                        *active.get_unchecked_mut(id as usize) += value;
-                                    }
-                                }
-                                offset += 10;
-                            }
-                        }
+                        local_count += parse_packet_payload(&bufs[i][..lengths[i]], max_id, &mut *active);
                     }
 
                     // Drain loop: fetch any other packets in the queue using non-blocking calls
@@ -526,41 +633,14 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                         match recv_batch_nonblocking(&socket, &mut bufs, &mut lengths) {
                             Ok(drain_count) if drain_count > 0 => {
                                 for i in 0..drain_count {
-                                    let n = lengths[i];
-                                    let mut offset = 0;
-                                    while offset + 6 <= n {
-                                        let ptr = unsafe { bufs[i].as_ptr().add(offset) };
-                                        let raw_id = unsafe { std::ptr::read_unaligned(ptr as *const i16) };
-                                        if raw_id < 0 {
-                                            // INT32 format (6 bytes total)
-                                            let id = (raw_id & 0x7FFF) as i32;
-                                            let value = unsafe { std::ptr::read_unaligned(ptr.add(2) as *const i32) } as f64;
-                                            if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-                                                unsafe {
-                                                    *active.get_unchecked_mut(id as usize) += value;
-                                                }
-                                            }
-                                            offset += 6;
-                                        } else {
-                                            // FLOAT64 format (10 bytes total)
-                                            if offset + 10 > n {
-                                                break;
-                                            }
-                                            let id = raw_id as i32;
-                                            let value = unsafe { std::ptr::read_unaligned(ptr.add(2) as *const f64) };
-                                            if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-                                                unsafe {
-                                                    *active.get_unchecked_mut(id as usize) += value;
-                                                }
-                                            }
-                                            offset += 10;
-                                        }
-                                    }
+                                    local_count += parse_packet_payload(&bufs[i][..lengths[i]], max_id, &mut *active);
                                 }
                             }
                             _ => break,
                         }
                     }
+
+                    metrics_received_clone.fetch_add(local_count as u64, Ordering::Relaxed);
                 }
                 _ => {} // Timeout or error, loop again to check running state
             }
@@ -585,6 +665,7 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         let now = SystemTime::now();
         let elapsed = now.duration_since(last_flush).unwrap_or(Duration::ZERO);
         if elapsed.as_secs_f64() >= flush_sec {
+            let received_count = metrics_received.swap(0, Ordering::Relaxed);
             let current_max = max_valid_id.load(Ordering::Relaxed) as usize;
             
             if local_flush_buffer.len() < current_max + 1 {
@@ -630,6 +711,18 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     // 3. Coordinator worker merges staging table into rollup tables
                     if worker_index == 0 {
                         coordinator_merge(client)?;
+                    }
+
+                    // 4. Update the total metrics processed count
+                    if received_count > 0 {
+                        let query = format!(
+                            "INSERT INTO stat_pg_processed (worker_id, count) \
+                             VALUES ({}, {}) \
+                             ON CONFLICT (worker_id) \
+                             DO UPDATE SET count = stat_pg_processed.count + EXCLUDED.count;",
+                            worker_index, received_count
+                        );
+                        client.update(&query, None, &[])?;
                     }
 
                     Ok::<(), pgrx::spi::Error>(())
@@ -711,6 +804,113 @@ mod tests {
 
             assert_eq!(val2, 10.0);
         });
+    }
+
+    #[pg_test]
+    fn test_udp_payload_parsing() {
+        let mut active = vec![0.0; 20];
+        let max_id = 19;
+        let mut payload = Vec::new();
+
+        // 1. FORMAT_INC (0), ID 1
+        payload.push(0);
+        payload.extend_from_slice(&1u16.to_le_bytes());
+
+        // 2. FORMAT_DEC (1), ID 2
+        payload.push(1);
+        payload.extend_from_slice(&2u16.to_le_bytes());
+
+        // 3. FORMAT_INT8 (2), ID 3, value -50
+        payload.push(2);
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.push(-50i8 as u8);
+
+        // 4. FORMAT_UINT8 (3), ID 4, value 200
+        payload.push(3);
+        payload.extend_from_slice(&4u16.to_le_bytes());
+        payload.push(200u8);
+
+        // 5. FORMAT_INT16 (4), ID 5, value -30000
+        payload.push(4);
+        payload.extend_from_slice(&5u16.to_le_bytes());
+        payload.extend_from_slice(&(-30000i16).to_le_bytes());
+
+        // 6. FORMAT_UINT16 (5), ID 6, value 60000
+        payload.push(5);
+        payload.extend_from_slice(&6u16.to_le_bytes());
+        payload.extend_from_slice(&60000u16.to_le_bytes());
+
+        // 7. FORMAT_FLOAT16 (6), ID 7, value 15.5
+        // 15.5 = + 1.9375 * 2^3. Sign=0, Exp = 3 + 15 = 18 = 0b10010. Mantissa = 0.9375 * 1024 = 960 = 0b1111000000.
+        // Bit representation: 0b0_10010_1111000000 = 0x4BC0.
+        payload.push(6);
+        payload.extend_from_slice(&7u16.to_le_bytes());
+        payload.extend_from_slice(&0x4BC0u16.to_le_bytes());
+
+        // 8. FORMAT_UFLOAT16 (7), ID 8, value 15.5
+        payload.push(7);
+        payload.extend_from_slice(&8u16.to_le_bytes());
+        payload.extend_from_slice(&0x4BC0u16.to_le_bytes());
+
+        // 9. FORMAT_INT32 (8), ID 9, value -2000000000
+        payload.push(8);
+        payload.extend_from_slice(&9u16.to_le_bytes());
+        payload.extend_from_slice(&(-2000000000i32).to_le_bytes());
+
+        // 10. FORMAT_UINT32 (9), ID 10, value 4000000000
+        payload.push(9);
+        payload.extend_from_slice(&10u16.to_le_bytes());
+        payload.extend_from_slice(&4000000000u32.to_le_bytes());
+
+        // 11. FORMAT_FLOAT32 (10), ID 11, value 123.456
+        payload.push(10);
+        payload.extend_from_slice(&11u16.to_le_bytes());
+        payload.extend_from_slice(&123.456f32.to_le_bytes());
+
+        // 12. FORMAT_UFLOAT32 (11), ID 12, value 123.456
+        payload.push(11);
+        payload.extend_from_slice(&12u16.to_le_bytes());
+        payload.extend_from_slice(&123.456f32.to_le_bytes());
+
+        // 13. FORMAT_INT64 (12), ID 13, value -9000000000000
+        payload.push(12);
+        payload.extend_from_slice(&13u16.to_le_bytes());
+        payload.extend_from_slice(&(-9000000000000i64).to_le_bytes());
+
+        // 14. FORMAT_UINT64 (13), ID 14, value 9000000000000
+        payload.push(13);
+        payload.extend_from_slice(&14u16.to_le_bytes());
+        payload.extend_from_slice(&9000000000000u64.to_le_bytes());
+
+        // 15. FORMAT_FLOAT64 (14), ID 15, value 12345.6789
+        payload.push(14);
+        payload.extend_from_slice(&15u16.to_le_bytes());
+        payload.extend_from_slice(&12345.6789f64.to_le_bytes());
+
+        // 16. FORMAT_UFLOAT64 (15), ID 16, value 12345.6789
+        payload.push(15);
+        payload.extend_from_slice(&16u16.to_le_bytes());
+        payload.extend_from_slice(&12345.6789f64.to_le_bytes());
+
+        let count = crate::parse_packet_payload(&payload, max_id, &mut active);
+        assert_eq!(count, 16);
+
+        assert_eq!(active[1], 1.0);
+        assert_eq!(active[2], -1.0);
+        assert_eq!(active[3], -50.0);
+        assert_eq!(active[4], 200.0);
+        assert_eq!(active[5], -30000.0);
+        assert_eq!(active[6], 60000.0);
+        assert_eq!(active[7], 15.5);
+        assert_eq!(active[8], 15.5);
+        assert_eq!(active[9], -2000000000.0);
+        assert_eq!(active[10], 4000000000.0);
+        assert!((active[11] - 123.456).abs() < 1e-4);
+        assert!((active[12] - 123.456).abs() < 1e-4);
+        assert_eq!(active[13], -9000000000000.0);
+        assert_eq!(active[14], 9000000000000.0);
+        assert_eq!(active[15], 12345.6789);
+        assert_eq!(active[16], 12345.6789);
     }
 }
 
