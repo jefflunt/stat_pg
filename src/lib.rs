@@ -5,7 +5,6 @@ use pgrx::spi::SpiClient;
 use pgrx::datum::DatumWithOid;
 use crate::pg_sys::PgOid;
 use std::ffi::CString;
-use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -347,6 +346,9 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     let mut local_flush_buffer = vec![0.0; max_id as usize + 1];
 
     while BackgroundWorker::worker_continue() {
+        if unsafe { pgrx::pg_sys::ShutdownRequestPending } != 0 {
+            std::process::exit(0);
+        }
         let now = SystemTime::now();
         let elapsed = now.duration_since(last_flush).unwrap_or(Duration::ZERO);
         if elapsed.as_secs_f64() >= flush_sec {
@@ -365,6 +367,10 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
             }
 
             let at = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() as i64;
+
+            if !BackgroundWorker::worker_continue() {
+                break;
+            }
 
             let result = BackgroundWorker::transaction(|| {
                 Spi::connect_mut(|client| {
