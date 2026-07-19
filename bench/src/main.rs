@@ -342,20 +342,21 @@ fn main() {
             for _ in 0..num_prebuilt {
                 let mut packet = Vec::with_capacity(1440);
                 let mut updates = 0u32;
-                while packet.len() + 12 <= 1440 {
+                while packet.len() + 10 <= 1440 {
                     let metric_idx = batch_idx % unique_metrics as usize;
                     let id = metric_ids_clone[metric_idx];
+                    let id_i16 = id as i16;
                     
                     // 50% chance of INT32 vs FLOAT64 format based on batch_idx
                     if batch_idx % 2 == 0 {
-                        // INT32 format: set sign bit of id, pack 4-byte value
-                        let raw_id = id | (1 << 31);
+                        // INT32 format: set sign bit of i16 id, pack 2-byte ID and 4-byte value
+                        let raw_id = id_i16 | (1 << 15);
                         packet.extend_from_slice(&raw_id.to_le_bytes());
                         let val_i32 = 1.0f64 as i32;
                         packet.extend_from_slice(&val_i32.to_le_bytes());
                     } else {
-                        // FLOAT64 format: positive id, pack 8-byte value
-                        packet.extend_from_slice(&id.to_le_bytes());
+                        // FLOAT64 format: positive id, pack 2-byte ID and 8-byte value
+                        packet.extend_from_slice(&id_i16.to_le_bytes());
                         packet.extend_from_slice(&1.0f64.to_le_bytes());
                     }
                     updates += 1;

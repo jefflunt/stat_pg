@@ -491,32 +491,32 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     for i in 0..count {
                         let n = lengths[i];
                         let mut offset = 0;
-                        while offset + 8 <= n {
+                        while offset + 6 <= n {
                             let ptr = unsafe { bufs[i].as_ptr().add(offset) };
-                            let raw_id = unsafe { std::ptr::read_unaligned(ptr as *const i32) };
+                            let raw_id = unsafe { std::ptr::read_unaligned(ptr as *const i16) };
                             if raw_id < 0 {
-                                // INT32 format (8 bytes total)
-                                let id = raw_id & 0x7FFFFFFF;
-                                let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const i32) } as f64;
+                                // INT32 format (6 bytes total)
+                                let id = (raw_id & 0x7FFF) as i32;
+                                let value = unsafe { std::ptr::read_unaligned(ptr.add(2) as *const i32) } as f64;
                                 if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
                                     unsafe {
                                         *active.get_unchecked_mut(id as usize) += value;
                                     }
                                 }
-                                offset += 8;
+                                offset += 6;
                             } else {
-                                // FLOAT64 format (12 bytes total)
-                                if offset + 12 > n {
+                                // FLOAT64 format (10 bytes total)
+                                if offset + 10 > n {
                                     break;
                                 }
-                                let id = raw_id;
-                                let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const f64) };
+                                let id = raw_id as i32;
+                                let value = unsafe { std::ptr::read_unaligned(ptr.add(2) as *const f64) };
                                 if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
                                     unsafe {
                                         *active.get_unchecked_mut(id as usize) += value;
                                     }
                                 }
-                                offset += 12;
+                                offset += 10;
                             }
                         }
                     }
@@ -528,32 +528,32 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                                 for i in 0..drain_count {
                                     let n = lengths[i];
                                     let mut offset = 0;
-                                    while offset + 8 <= n {
+                                    while offset + 6 <= n {
                                         let ptr = unsafe { bufs[i].as_ptr().add(offset) };
-                                        let raw_id = unsafe { std::ptr::read_unaligned(ptr as *const i32) };
+                                        let raw_id = unsafe { std::ptr::read_unaligned(ptr as *const i16) };
                                         if raw_id < 0 {
-                                            // INT32 format (8 bytes total)
-                                            let id = raw_id & 0x7FFFFFFF;
-                                            let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const i32) } as f64;
+                                            // INT32 format (6 bytes total)
+                                            let id = (raw_id & 0x7FFF) as i32;
+                                            let value = unsafe { std::ptr::read_unaligned(ptr.add(2) as *const i32) } as f64;
                                             if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
                                                 unsafe {
                                                     *active.get_unchecked_mut(id as usize) += value;
                                                 }
                                             }
-                                            offset += 8;
+                                            offset += 6;
                                         } else {
-                                            // FLOAT64 format (12 bytes total)
-                                            if offset + 12 > n {
+                                            // FLOAT64 format (10 bytes total)
+                                            if offset + 10 > n {
                                                 break;
                                             }
-                                            let id = raw_id;
-                                            let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const f64) };
+                                            let id = raw_id as i32;
+                                            let value = unsafe { std::ptr::read_unaligned(ptr.add(2) as *const f64) };
                                             if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
                                                 unsafe {
                                                     *active.get_unchecked_mut(id as usize) += value;
                                                 }
                                             }
-                                            offset += 12;
+                                            offset += 10;
                                         }
                                     }
                                 }
