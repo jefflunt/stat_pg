@@ -6,6 +6,82 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::thread;
 
+const FORMAT_WIDTHS: [usize; 16] = [2, 2, 3, 3, 4, 4, 4, 4, 6, 6, 6, 6, 10, 10, 10, 10];
+
+struct PendingPacket {
+    buf: Vec<u8>,
+    num_segments: u8,
+}
+
+impl PendingPacket {
+    fn new() -> Self {
+        Self {
+            buf: vec![0], // placeholder for num_segments
+            num_segments: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.buf.push(0); // placeholder
+        self.num_segments = 0;
+    }
+}
+
+fn flush_format_buffers<F>(
+    format_buffers: &mut [Vec<u8>; 16],
+    current_packet: &mut PendingPacket,
+    send_fn: &F,
+) where
+    F: Fn(&[u8]),
+{
+    for f in 0..16 {
+        let data = &format_buffers[f];
+        if data.is_empty() {
+            continue;
+        }
+
+        let width = FORMAT_WIDTHS[f];
+        let total_updates = data.len() / width;
+        let mut remaining_updates = total_updates;
+        let mut slice_offset = 0;
+
+        while remaining_updates > 0 {
+            let remaining_space = 1440 - current_packet.buf.len();
+            if remaining_space < 3 + width {
+                if current_packet.num_segments > 0 {
+                    current_packet.buf[0] = current_packet.num_segments;
+                    send_fn(&current_packet.buf);
+                }
+                current_packet.clear();
+            }
+
+            let max_possible = (1440 - current_packet.buf.len() - 3) / width;
+            let updates_to_write = std::cmp::min(remaining_updates, max_possible);
+
+            if updates_to_write > 0 {
+                current_packet.buf.push(f as u8);
+                current_packet.buf.extend_from_slice(&(updates_to_write as u16).to_le_bytes());
+                
+                let start_idx = slice_offset;
+                let end_idx = slice_offset + updates_to_write * width;
+                current_packet.buf.extend_from_slice(&data[start_idx..end_idx]);
+
+                current_packet.num_segments += 1;
+                slice_offset = end_idx;
+                remaining_updates -= updates_to_write;
+            } else {
+                if current_packet.num_segments > 0 {
+                    current_packet.buf[0] = current_packet.num_segments;
+                    send_fn(&current_packet.buf);
+                }
+                current_packet.clear();
+            }
+        }
+        format_buffers[f].clear();
+    }
+}
+
 fn print_help() {
     println!(
         "stat-pg-client - StatsD-compatible UDP proxy daemon\n\n\
@@ -203,7 +279,7 @@ fn main() {
             continue;
         }
 
-        let mut payload = Vec::new();
+        let mut format_buffers = vec![Vec::new(); 16];
 
         for (name, val) in local_aggs {
             // Check cache
@@ -240,74 +316,74 @@ fn main() {
                     final_val = val * 10000.0;
                 }
 
+                let final_format: u8;
+                let mut payload_bytes = Vec::new();
+
                 // Dynamically select the most compact format representation for final_val:
                 if final_val == 1.0 {
-                    payload.push(0); // FORMAT_INC
-                    payload.extend_from_slice(&id_i16.to_le_bytes());
+                    final_format = 0;
                 } else if final_val == -1.0 {
-                    payload.push(1); // FORMAT_DEC
-                    payload.extend_from_slice(&id_i16.to_le_bytes());
+                    final_format = 1;
                 } else if final_val.fract() == 0.0 {
                     if final_val >= -128.0 && final_val <= 127.0 {
-                        payload.push(2); // FORMAT_INT8
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.push((final_val as i8) as u8);
+                        final_format = 2;
+                        payload_bytes.push((final_val as i8) as u8);
                     } else if final_val >= 0.0 && final_val <= 255.0 {
-                        payload.push(3); // FORMAT_UINT8
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.push(final_val as u8);
+                        final_format = 3;
+                        payload_bytes.push(final_val as u8);
                     } else if final_val >= -32768.0 && final_val <= 32767.0 {
-                        payload.push(4); // FORMAT_INT16
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.extend_from_slice(&(final_val as i16).to_le_bytes());
+                        final_format = 4;
+                        payload_bytes.extend_from_slice(&(final_val as i16).to_le_bytes());
                     } else if final_val >= 0.0 && final_val <= 65535.0 {
-                        payload.push(5); // FORMAT_UINT16
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.extend_from_slice(&(final_val as u16).to_le_bytes());
+                        final_format = 5;
+                        payload_bytes.extend_from_slice(&(final_val as u16).to_le_bytes());
                     } else if final_val >= i32::MIN as f64 && final_val <= i32::MAX as f64 {
-                        payload.push(8); // FORMAT_INT32
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.extend_from_slice(&(final_val as i32).to_le_bytes());
+                        final_format = 8;
+                        payload_bytes.extend_from_slice(&(final_val as i32).to_le_bytes());
                     } else if final_val >= u32::MIN as f64 && final_val <= u32::MAX as f64 {
-                        payload.push(9); // FORMAT_UINT32
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.extend_from_slice(&(final_val as u32).to_le_bytes());
+                        final_format = 9;
+                        payload_bytes.extend_from_slice(&(final_val as u32).to_le_bytes());
                     } else if final_val >= i64::MIN as f64 && final_val <= i64::MAX as f64 {
-                        payload.push(12); // FORMAT_INT64
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.extend_from_slice(&(final_val as i64).to_le_bytes());
+                        final_format = 12;
+                        payload_bytes.extend_from_slice(&(final_val as i64).to_le_bytes());
                     } else if final_val >= u64::MIN as f64 && final_val <= u64::MAX as f64 {
-                        payload.push(13); // FORMAT_UINT64
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.extend_from_slice(&(final_val as u64).to_le_bytes());
+                        final_format = 13;
+                        payload_bytes.extend_from_slice(&(final_val as u64).to_le_bytes());
                     } else {
-                        payload.push(14); // FORMAT_FLOAT64
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.extend_from_slice(&final_val.to_le_bytes());
+                        final_format = 14;
+                        payload_bytes.extend_from_slice(&final_val.to_le_bytes());
                     }
                 } else {
                     let val_f32 = final_val as f32;
                     if val_f32 as f64 == final_val {
-                        payload.push(10); // FORMAT_FLOAT32
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.extend_from_slice(&val_f32.to_le_bytes());
+                        final_format = 10;
+                        payload_bytes.extend_from_slice(&val_f32.to_le_bytes());
                     } else {
-                        payload.push(14); // FORMAT_FLOAT64
-                        payload.extend_from_slice(&id_i16.to_le_bytes());
-                        payload.extend_from_slice(&final_val.to_le_bytes());
+                        final_format = 14;
+                        payload_bytes.extend_from_slice(&final_val.to_le_bytes());
                     }
                 }
 
-                // If payload is getting close to MTU (1,472 bytes for UDP), send it
-                if payload.len() >= 1440 {
-                    let _ = server_socket.send_to(&payload, &server_addr);
-                    payload.clear();
-                }
+                let f_buf = &mut format_buffers[final_format as usize];
+                f_buf.extend_from_slice(&id_i16.to_le_bytes());
+                f_buf.extend_from_slice(&payload_bytes);
             }
         }
 
-        if !payload.is_empty() {
-            let _ = server_socket.send_to(&payload, &server_addr);
+        let mut format_buffers_array: [Vec<u8>; 16] = format_buffers.try_into().unwrap();
+        let mut current_packet = PendingPacket::new();
+
+        flush_format_buffers(
+            &mut format_buffers_array,
+            &mut current_packet,
+            &|packet_data| {
+                let _ = server_socket.send_to(packet_data, &server_addr);
+            }
+        );
+
+        if current_packet.num_segments > 0 {
+            current_packet.buf[0] = current_packet.num_segments;
+            let _ = server_socket.send_to(&current_packet.buf, &server_addr);
         }
     }
 }

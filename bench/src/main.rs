@@ -33,6 +33,82 @@ impl SimpleRng {
     }
 }
 
+const FORMAT_WIDTHS: [usize; 16] = [2, 2, 3, 3, 4, 4, 4, 4, 6, 6, 6, 6, 10, 10, 10, 10];
+
+struct PendingPacket {
+    buf: Vec<u8>,
+    num_segments: u8,
+}
+
+impl PendingPacket {
+    fn new() -> Self {
+        Self {
+            buf: vec![0], // placeholder for num_segments
+            num_segments: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.buf.push(0); // placeholder
+        self.num_segments = 0;
+    }
+}
+
+fn flush_format_buffers<F>(
+    format_buffers: &mut [Vec<u8>; 16],
+    current_packet: &mut PendingPacket,
+    mut send_fn: F,
+) where
+    F: FnMut(&[u8]),
+{
+    for f in 0..16 {
+        let data = &format_buffers[f];
+        if data.is_empty() {
+            continue;
+        }
+
+        let width = FORMAT_WIDTHS[f];
+        let total_updates = data.len() / width;
+        let mut remaining_updates = total_updates;
+        let mut slice_offset = 0;
+
+        while remaining_updates > 0 {
+            let remaining_space = 1440 - current_packet.buf.len();
+            if remaining_space < 3 + width {
+                if current_packet.num_segments > 0 {
+                    current_packet.buf[0] = current_packet.num_segments;
+                    send_fn(&current_packet.buf);
+                }
+                current_packet.clear();
+            }
+
+            let max_possible = (1440 - current_packet.buf.len() - 3) / width;
+            let updates_to_write = std::cmp::min(remaining_updates, max_possible);
+
+            if updates_to_write > 0 {
+                current_packet.buf.push(f as u8);
+                current_packet.buf.extend_from_slice(&(updates_to_write as u16).to_le_bytes());
+                
+                let start_idx = slice_offset;
+                let end_idx = slice_offset + updates_to_write * width;
+                current_packet.buf.extend_from_slice(&data[start_idx..end_idx]);
+
+                current_packet.num_segments += 1;
+                slice_offset = end_idx;
+                remaining_updates -= updates_to_write;
+            } else {
+                if current_packet.num_segments > 0 {
+                    current_packet.buf[0] = current_packet.num_segments;
+                    send_fn(&current_packet.buf);
+                }
+                current_packet.clear();
+            }
+        }
+        format_buffers[f].clear();
+    }
+}
+
 fn print_help() {
     println!(
         "stat-pg-bench - High-speed TCP stress test benchmark tool\n\n\
@@ -461,8 +537,7 @@ fn main() {
                     local_generated += batch_size as u64;
 
                     // Serialize aggregated values
-                    let mut packet = Vec::with_capacity(1440);
-                    let mut packet_metrics = 0u32;
+                    let mut format_buffers = vec![Vec::new(); 16];
 
                     for &metric_idx in &touched {
                         let val = local_values[metric_idx];
@@ -520,28 +595,53 @@ fn main() {
                             }
                         }
 
-                        let width = 3 + payload_bytes.len();
-                        if packet.len() + width > 1440 {
-                            let _ = socket.send(&packet);
-                            local_packets += 1;
-                            local_metrics += packet_metrics as u64;
-                            local_bytes += packet.len() as u64;
-
-                            packet.clear();
-                            packet_metrics = 0;
-                        }
-
-                        packet.push(final_format);
-                        packet.extend_from_slice(&id_i16.to_le_bytes());
-                        packet.extend(&payload_bytes);
-                        packet_metrics += 1;
+                        let f_buf = &mut format_buffers[final_format as usize];
+                        f_buf.extend_from_slice(&id_i16.to_le_bytes());
+                        f_buf.extend_from_slice(&payload_bytes);
                     }
 
-                    if !packet.is_empty() {
-                        let _ = socket.send(&packet);
+                    let mut format_buffers_array: [Vec<u8>; 16] = format_buffers.try_into().unwrap();
+                    let mut current_packet = PendingPacket::new();
+
+                    flush_format_buffers(
+                        &mut format_buffers_array,
+                        &mut current_packet,
+                        |packet_data| {
+                            let _ = socket.send(packet_data);
+                            local_packets += 1;
+                            
+                            let mut updates_in_packet = 0u64;
+                            let num_segs = packet_data[0] as usize;
+                            let mut off = 1;
+                            for _ in 0..num_segs {
+                                if off + 3 > packet_data.len() { break; }
+                                let f = packet_data[off];
+                                let count = unsafe { std::ptr::read_unaligned(packet_data.as_ptr().add(off + 1) as *const u16) } as usize;
+                                updates_in_packet += count as u64;
+                                off += 3 + count * FORMAT_WIDTHS[f as usize];
+                            }
+                            local_metrics += updates_in_packet;
+                            local_bytes += packet_data.len() as u64;
+                        }
+                    );
+
+                    if current_packet.num_segments > 0 {
+                        current_packet.buf[0] = current_packet.num_segments;
+                        let _ = socket.send(&current_packet.buf);
                         local_packets += 1;
-                        local_metrics += packet_metrics as u64;
-                        local_bytes += packet.len() as u64;
+                        
+                        let mut updates_in_packet = 0u64;
+                        let num_segs = current_packet.buf[0] as usize;
+                        let mut off = 1;
+                        for _ in 0..num_segs {
+                            if off + 3 > current_packet.buf.len() { break; }
+                            let f = current_packet.buf[off];
+                            let count = unsafe { std::ptr::read_unaligned(current_packet.buf.as_ptr().add(off + 1) as *const u16) } as usize;
+                            updates_in_packet += count as u64;
+                            off += 3 + count * FORMAT_WIDTHS[f as usize];
+                        }
+                        local_metrics += updates_in_packet;
+                        local_bytes += current_packet.buf.len() as u64;
                     }
 
                     // Reset local aggregators
@@ -572,81 +672,103 @@ fn main() {
                 let mut prebuilt_packets = Vec::with_capacity(num_prebuilt);
                 let mut batch_idx = thread_id as usize;
 
-                for _ in 0..num_prebuilt {
-                    let mut packet = Vec::with_capacity(1440);
-                    let mut updates = 0u32;
-                    while packet.len() + 11 <= 1440 {
+                let mut format_buffers = vec![Vec::new(); 16];
+                let mut current_packet = PendingPacket::new();
+
+                while prebuilt_packets.len() < num_prebuilt {
+                    // Populate format buffers with random updates
+                    for _ in 0..5000 {
                         let metric_idx = batch_idx % unique_metrics as usize;
                         let id = metric_ids_clone[metric_idx];
                         let id_i16 = id as i16;
 
                         let rand_val = rng.next_f64();
+                        let format: u8;
+                        let mut val_bytes = Vec::new();
+
                         if rand_val < 0.60 {
-                            let format = if rng.next_u64() % 2 == 0 { 0u8 } else { 1u8 };
-                            packet.push(format);
-                            packet.extend_from_slice(&id_i16.to_le_bytes());
+                            format = if rng.next_u64() % 2 == 0 { 0u8 } else { 1u8 };
                         } else if rand_val < 0.75 {
-                            let format = if rng.next_u64() % 2 == 0 { 2u8 } else { 3u8 };
-                            packet.push(format);
-                            packet.extend_from_slice(&id_i16.to_le_bytes());
+                            format = if rng.next_u64() % 2 == 0 { 2u8 } else { 3u8 };
                             let val_u8 = (rng.next_u64() % 256) as u8;
-                            packet.push(val_u8);
+                            val_bytes.push(val_u8);
                         } else if rand_val < 0.90 {
                             let format_choice = rng.next_u64() % 4;
-                            let format = match format_choice {
+                            format = match format_choice {
                                 0 => 4u8,
                                 1 => 5u8,
                                 2 => 6u8,
                                 _ => 7u8,
                             };
-                            packet.push(format);
-                            packet.extend_from_slice(&id_i16.to_le_bytes());
                             if format == 6 || format == 7 {
-                                packet.extend_from_slice(&0x4BC0u16.to_le_bytes());
+                                val_bytes.extend_from_slice(&0x4BC0u16.to_le_bytes());
                             } else {
                                 let val_u16 = (rng.next_u64() % 65536) as u16;
-                                packet.extend_from_slice(&val_u16.to_le_bytes());
+                                val_bytes.extend_from_slice(&val_u16.to_le_bytes());
                             }
                         } else if rand_val < 0.98 {
                             let format_choice = rng.next_u64() % 4;
-                            let format = match format_choice {
+                            format = match format_choice {
                                 0 => 8u8,
                                 1 => 9u8,
                                 2 => 10u8,
                                 _ => 11u8,
                             };
-                            packet.push(format);
-                            packet.extend_from_slice(&id_i16.to_le_bytes());
                             if format == 10 || format == 11 {
                                 let val_f32 = (rng.next_f64() * 1000.0) as f32;
-                                packet.extend_from_slice(&val_f32.to_le_bytes());
+                                val_bytes.extend_from_slice(&val_f32.to_le_bytes());
                             } else {
                                 let val_u32 = rng.next_u64() as u32;
-                                packet.extend_from_slice(&val_u32.to_le_bytes());
+                                val_bytes.extend_from_slice(&val_u32.to_le_bytes());
                             }
                         } else {
                             let format_choice = rng.next_u64() % 4;
-                            let format = match format_choice {
+                            format = match format_choice {
                                 0 => 12u8,
                                 1 => 13u8,
                                 2 => 14u8,
                                 _ => 15u8,
                             };
-                            packet.push(format);
-                            packet.extend_from_slice(&id_i16.to_le_bytes());
                             if format == 14 || format == 15 {
                                 let val_f64 = rng.next_f64() * 1000.0;
-                                packet.extend_from_slice(&val_f64.to_le_bytes());
+                                val_bytes.extend_from_slice(&val_f64.to_le_bytes());
                             } else {
                                 let val_u64 = rng.next_u64();
-                                packet.extend_from_slice(&val_u64.to_le_bytes());
+                                val_bytes.extend_from_slice(&val_u64.to_le_bytes());
                             }
                         }
 
-                        updates += 1;
+                        let f_buf = &mut format_buffers[format as usize];
+                        f_buf.extend_from_slice(&id_i16.to_le_bytes());
+                        f_buf.extend_from_slice(&val_bytes);
+
                         batch_idx = batch_idx.wrapping_add(threads as usize);
                     }
-                    prebuilt_packets.push((packet, updates));
+
+                    // Flush format buffers into prebuilt_packets
+                    let mut format_buffers_array: [Vec<u8>; 16] = format_buffers.clone().try_into().unwrap();
+                    flush_format_buffers(
+                        &mut format_buffers_array,
+                        &mut current_packet,
+                        |packet_data| {
+                            if prebuilt_packets.len() < num_prebuilt {
+                                let mut updates_in_packet = 0u32;
+                                let num_segs = packet_data[0] as usize;
+                                let mut off = 1;
+                                for _ in 0..num_segs {
+                                    if off + 3 > packet_data.len() { break; }
+                                    let f = packet_data[off];
+                                    let count = unsafe { std::ptr::read_unaligned(packet_data.as_ptr().add(off + 1) as *const u16) } as usize;
+                                    updates_in_packet += count as u32;
+                                    off += 3 + count * FORMAT_WIDTHS[f as usize];
+                                }
+                                prebuilt_packets.push((packet_data.to_vec(), updates_in_packet));
+                            }
+                        }
+                    );
+                    for f in 0..16 {
+                        format_buffers[f] = format_buffers_array[f].clone();
+                    }
                 }
 
                 #[cfg(target_os = "linux")]

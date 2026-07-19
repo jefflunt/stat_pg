@@ -511,106 +511,201 @@ fn f16_to_f64(bits: u16) -> f64 {
 #[inline(always)]
 fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize {
     let n = buf.len();
-    let mut offset = 0;
-    let mut parsed_count = 0;
-    while offset + 3 <= n {
-        let ptr = unsafe { buf.as_ptr().add(offset) };
-        let format = unsafe { *ptr };
-        let id = unsafe { std::ptr::read_unaligned(ptr.add(1) as *const i16) } as i32;
+    if n < 1 { return 0; }
 
-        if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-            let active_ref = unsafe { active.get_unchecked_mut(id as usize) };
-            match format {
-                0 => {
-                    *active_ref += 1.0;
-                    offset += 3;
-                }
-                1 => {
-                    *active_ref -= 1.0;
-                    offset += 3;
-                }
-                2 => {
-                    if offset + 4 > n { break; }
-                    let val = unsafe { *(ptr.add(3) as *const i8) };
-                    *active_ref += val as f64;
-                    offset += 4;
-                }
-                3 => {
-                    if offset + 4 > n { break; }
-                    let val = unsafe { *(ptr.add(3) as *const u8) };
-                    *active_ref += val as f64;
-                    offset += 4;
-                }
-                4 => {
-                    if offset + 5 > n { break; }
-                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i16) };
-                    *active_ref += val as f64;
-                    offset += 5;
-                }
-                5 => {
-                    if offset + 5 > n { break; }
-                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u16) };
-                    *active_ref += val as f64;
-                    offset += 5;
-                }
-                6 | 7 => {
-                    if offset + 5 > n { break; }
-                    let val_bits = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u16) };
-                    *active_ref += f16_to_f64(val_bits);
-                    offset += 5;
-                }
-                8 => {
-                    if offset + 7 > n { break; }
-                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i32) };
-                    *active_ref += val as f64;
-                    offset += 7;
-                }
-                9 => {
-                    if offset + 7 > n { break; }
-                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u32) };
-                    *active_ref += val as f64;
-                    offset += 7;
-                }
-                10 | 11 => {
-                    if offset + 7 > n { break; }
-                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const f32) };
-                    *active_ref += val as f64;
-                    offset += 7;
-                }
-                12 => {
-                    if offset + 11 > n { break; }
-                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i64) };
-                    *active_ref += val as f64;
-                    offset += 11;
-                }
-                13 => {
-                    if offset + 11 > n { break; }
-                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u64) };
-                    *active_ref += val as f64;
-                    offset += 11;
-                }
-                14 | 15 => {
-                    if offset + 11 > n { break; }
-                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const f64) };
-                    *active_ref += val;
-                    offset += 11;
-                }
-                _ => {
-                    break;
+    let num_segments = buf[0] as usize;
+    let mut offset = 1;
+    let mut parsed_count = 0;
+
+    for _ in 0..num_segments {
+        if offset + 3 > n { break; }
+        let format = buf[offset];
+        let num_updates = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 1) as *const u16) } as usize;
+        offset += 3;
+
+        match format {
+            0 => {
+                let segment_len = num_updates * 2;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += 1.0; }
+                        parsed_count += 1;
+                    }
+                    offset += 2;
                 }
             }
-            parsed_count += 1;
-        } else {
-            let width = match format {
-                0 | 1 => 3,
-                2 | 3 => 4,
-                4 | 5 | 6 | 7 => 5,
-                8 | 9 | 10 | 11 => 7,
-                12 | 13 | 14 | 15 => 11,
-                _ => break,
-            };
-            if offset + width > n { break; }
-            offset += width;
+            1 => {
+                let segment_len = num_updates * 2;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) -= 1.0; }
+                        parsed_count += 1;
+                    }
+                    offset += 2;
+                }
+            }
+            2 => {
+                let segment_len = num_updates * 3;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { *buf.as_ptr().add(offset + 2) as i8 } as f64;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 3;
+                }
+            }
+            3 => {
+                let segment_len = num_updates * 3;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { *buf.as_ptr().add(offset + 2) } as f64;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 3;
+                }
+            }
+            4 => {
+                let segment_len = num_updates * 4;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const i16) } as f64;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 4;
+                }
+            }
+            5 => {
+                let segment_len = num_updates * 4;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const u16) } as f64;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 4;
+                }
+            }
+            6 | 7 => {
+                let segment_len = num_updates * 4;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val_bits = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const u16) };
+                    let val = f16_to_f64(val_bits);
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 4;
+                }
+            }
+            8 => {
+                let segment_len = num_updates * 6;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const i32) } as f64;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 6;
+                }
+            }
+            9 => {
+                let segment_len = num_updates * 6;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const u32) } as f64;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 6;
+                }
+            }
+            10 | 11 => {
+                let segment_len = num_updates * 6;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const f32) } as f64;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 6;
+                }
+            }
+            12 => {
+                let segment_len = num_updates * 10;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const i64) } as f64;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 10;
+                }
+            }
+            13 => {
+                let segment_len = num_updates * 10;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const u64) } as f64;
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 10;
+                }
+            }
+            14 | 15 => {
+                let segment_len = num_updates * 10;
+                if offset + segment_len > n { break; }
+                
+                for _ in 0..num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const f64) };
+                    if id > 0 && id <= max_id && id < active.len() {
+                        unsafe { *active.get_unchecked_mut(id) += val; }
+                        parsed_count += 1;
+                    }
+                    offset += 10;
+                }
+            }
+            _ => break,
         }
     }
     parsed_count
@@ -896,108 +991,87 @@ fn stat_pg_udp_stats() -> TableIterator<'static, (name!(received, i64), name!(dr
 #[pg_extern]
 fn stat_pg_force_rollups() -> Result<(), pgrx::spi::Error> {
     Spi::connect_mut(|client| {
-        // 1. Force Minute Rollup
+        // 1. Truncate all rollup tables to prevent double-counting upon clean rebuild
+        client.update("TRUNCATE evt_mins, evt_hours, evt_days, evt_30s, stat_pg_rollups;", None, &[])?;
+
+        // 2. Force Minute Rollup from evt_secs
         let max_sec: Option<i64> = client.select("SELECT MAX(at) FROM evt_secs;", None, &[])?.first().get_one()?;
         if let Some(ms) = max_sec {
-            let last_min = get_rollup_val(client, "minute")?;
             let current_min = ms / 60 + 1;
-            if current_min > last_min {
-                let start_at = last_min * 60;
-                let end_at = current_min * 60;
-                let query = format!(
-                    "INSERT INTO evt_mins (metric_id, at, value) \
-                     SELECT metric_id, at / 60, SUM(value) \
-                     FROM evt_secs \
-                     WHERE at >= {} AND at < {} \
-                     GROUP BY metric_id, at / 60 \
-                     ORDER BY at / 60, metric_id \
-                     ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_mins.value + EXCLUDED.value;",
-                    start_at, end_at
-                );
-                client.update(&query, None, &[])?;
-                client.update(
-                    &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'minute';", current_min),
-                    None, &[]
-                )?;
-            }
+            let query = format!(
+                "INSERT INTO evt_mins (metric_id, at, value) \
+                 SELECT metric_id, at / 60, SUM(value) \
+                 FROM evt_secs \
+                 GROUP BY metric_id, at / 60 \
+                 ORDER BY at / 60, metric_id \
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_mins.value + EXCLUDED.value;"
+            );
+            client.update(&query, None, &[])?;
+            client.update(
+                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('minute', {}) \
+                          ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_min),
+                None, &[]
+            )?;
         }
 
-        // 2. Force Hour Rollup
+        // 3. Force Hour Rollup from evt_mins
         let max_min: Option<i64> = client.select("SELECT MAX(at) FROM evt_mins;", None, &[])?.first().get_one()?;
         if let Some(mm) = max_min {
-            let last_hour = get_rollup_val(client, "hour")?;
             let current_hour = mm / 60 + 1;
-            if current_hour > last_hour {
-                let start_at = last_hour * 60;
-                let end_at = current_hour * 60;
-                let query = format!(
-                    "INSERT INTO evt_hours (metric_id, at, value) \
-                     SELECT metric_id, at / 60, SUM(value) \
-                     FROM evt_mins \
-                     WHERE at >= {} AND at < {} \
-                     GROUP BY metric_id, at / 60 \
-                     ORDER BY at / 60, metric_id \
-                     ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_hours.value + EXCLUDED.value;",
-                    start_at, end_at
-                );
-                client.update(&query, None, &[])?;
-                client.update(
-                    &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'hour';", current_hour),
-                    None, &[]
-                )?;
-            }
+            let query = format!(
+                "INSERT INTO evt_hours (metric_id, at, value) \
+                 SELECT metric_id, at / 60, SUM(value) \
+                 FROM evt_mins \
+                 GROUP BY metric_id, at / 60 \
+                 ORDER BY at / 60, metric_id \
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_hours.value + EXCLUDED.value;"
+            );
+            client.update(&query, None, &[])?;
+            client.update(
+                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('hour', {}) \
+                          ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_hour),
+                None, &[]
+            )?;
         }
 
-        // 3. Force Day Rollup
+        // 4. Force Day Rollup from evt_hours
         let max_hour: Option<i64> = client.select("SELECT MAX(at) FROM evt_hours;", None, &[])?.first().get_one()?;
         if let Some(mh) = max_hour {
-            let last_day = get_rollup_val(client, "day")?;
             let current_day = mh / 24 + 1;
-            if current_day > last_day {
-                let start_at = last_day * 24;
-                let end_at = current_day * 24;
-                let query = format!(
-                    "INSERT INTO evt_days (metric_id, at, value) \
-                     SELECT metric_id, at / 24, SUM(value) \
-                     FROM evt_hours \
-                     WHERE at >= {} AND at < {} \
-                     GROUP BY metric_id, at / 24 \
-                     ORDER BY at / 24, metric_id \
-                     ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_days.value + EXCLUDED.value;",
-                    start_at, end_at
-                );
-                client.update(&query, None, &[])?;
-                client.update(
-                    &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'day';", current_day),
-                    None, &[]
-                )?;
-            }
+            let query = format!(
+                "INSERT INTO evt_days (metric_id, at, value) \
+                 SELECT metric_id, at / 24, SUM(value) \
+                 FROM evt_hours \
+                 GROUP BY metric_id, at / 24 \
+                 ORDER BY at / 24, metric_id \
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_days.value + EXCLUDED.value;"
+            );
+            client.update(&query, None, &[])?;
+            client.update(
+                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('day', {}) \
+                          ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_day),
+                None, &[]
+            )?;
         }
 
-        // 4. Force 30d Rollup
+        // 5. Force 30d Rollup from evt_days
         let max_day: Option<i64> = client.select("SELECT MAX(at) FROM evt_days;", None, &[])?.first().get_one()?;
         if let Some(md) = max_day {
-            let last_30d = get_rollup_val(client, "30d")?;
             let current_30d = md / 30 + 1;
-            if current_30d > last_30d {
-                let start_at = last_30d * 30;
-                let end_at = current_30d * 30;
-                let query = format!(
-                    "INSERT INTO evt_30s (metric_id, at, value) \
-                     SELECT metric_id, at / 30, SUM(value) \
-                     FROM evt_days \
-                     WHERE at >= {} AND at < {} \
-                     GROUP BY metric_id, at / 30 \
-                     ORDER BY at / 30, metric_id \
-                     ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_30s.value + EXCLUDED.value;",
-                    start_at, end_at
-                );
-                client.update(&query, None, &[])?;
-                client.update(
-                    &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = '30d';", current_30d),
-                    None, &[]
-                )?;
-            }
+            let query = format!(
+                "INSERT INTO evt_30s (metric_id, at, value) \
+                 SELECT metric_id, at / 30, SUM(value) \
+                 FROM evt_days \
+                 GROUP BY metric_id, at / 30 \
+                 ORDER BY at / 30, metric_id \
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_30s.value + EXCLUDED.value;"
+            );
+            client.update(&query, None, &[])?;
+            client.update(
+                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('30d', {}) \
+                          ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_30d),
+                None, &[]
+            )?;
         }
 
         Ok::<(), pgrx::spi::Error>(())
@@ -1061,83 +1135,100 @@ mod tests {
         let max_id = 19;
         let mut payload = Vec::new();
 
+        // 16 segments
+        payload.push(16);
+
         // 1. FORMAT_INC (0), ID 1
         payload.push(0);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&1u16.to_le_bytes());
 
         // 2. FORMAT_DEC (1), ID 2
         payload.push(1);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&2u16.to_le_bytes());
 
         // 3. FORMAT_INT8 (2), ID 3, value -50
         payload.push(2);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&3u16.to_le_bytes());
         payload.push(-50i8 as u8);
 
         // 4. FORMAT_UINT8 (3), ID 4, value 200
         payload.push(3);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&4u16.to_le_bytes());
         payload.push(200u8);
 
         // 5. FORMAT_INT16 (4), ID 5, value -30000
         payload.push(4);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&5u16.to_le_bytes());
         payload.extend_from_slice(&(-30000i16).to_le_bytes());
 
         // 6. FORMAT_UINT16 (5), ID 6, value 60000
         payload.push(5);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&6u16.to_le_bytes());
         payload.extend_from_slice(&60000u16.to_le_bytes());
 
         // 7. FORMAT_FLOAT16 (6), ID 7, value 15.5
-        // 15.5 = + 1.9375 * 2^3. Sign=0, Exp = 3 + 15 = 18 = 0b10010. Mantissa = 0.9375 * 1024 = 960 = 0b1111000000.
-        // Bit representation: 0b0_10010_1111000000 = 0x4BC0.
         payload.push(6);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&7u16.to_le_bytes());
         payload.extend_from_slice(&0x4BC0u16.to_le_bytes());
 
         // 8. FORMAT_UFLOAT16 (7), ID 8, value 15.5
         payload.push(7);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&8u16.to_le_bytes());
         payload.extend_from_slice(&0x4BC0u16.to_le_bytes());
 
         // 9. FORMAT_INT32 (8), ID 9, value -2000000000
         payload.push(8);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&9u16.to_le_bytes());
         payload.extend_from_slice(&(-2000000000i32).to_le_bytes());
 
         // 10. FORMAT_UINT32 (9), ID 10, value 4000000000
         payload.push(9);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&10u16.to_le_bytes());
         payload.extend_from_slice(&4000000000u32.to_le_bytes());
 
         // 11. FORMAT_FLOAT32 (10), ID 11, value 123.456
         payload.push(10);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&11u16.to_le_bytes());
         payload.extend_from_slice(&123.456f32.to_le_bytes());
 
         // 12. FORMAT_UFLOAT32 (11), ID 12, value 123.456
         payload.push(11);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&12u16.to_le_bytes());
         payload.extend_from_slice(&123.456f32.to_le_bytes());
 
         // 13. FORMAT_INT64 (12), ID 13, value -9000000000000
         payload.push(12);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&13u16.to_le_bytes());
         payload.extend_from_slice(&(-9000000000000i64).to_le_bytes());
 
         // 14. FORMAT_UINT64 (13), ID 14, value 9000000000000
         payload.push(13);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&14u16.to_le_bytes());
         payload.extend_from_slice(&9000000000000u64.to_le_bytes());
 
         // 15. FORMAT_FLOAT64 (14), ID 15, value 12345.6789
         payload.push(14);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&15u16.to_le_bytes());
         payload.extend_from_slice(&12345.6789f64.to_le_bytes());
 
         // 16. FORMAT_UFLOAT64 (15), ID 16, value 12345.6789
         payload.push(15);
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload.extend_from_slice(&16u16.to_le_bytes());
         payload.extend_from_slice(&12345.6789f64.to_le_bytes());
 
