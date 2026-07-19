@@ -63,6 +63,7 @@ static BIND_ADDR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::n
 static PORT: GucSetting<i32> = GucSetting::<i32>::new(8125);
 static FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new(1.0);
 static BUFFER_WINDOW: GucSetting<i32> = GucSetting::<i32>::new(5);
+static WORKERS: GucSetting<i32> = GucSetting::<i32>::new(4);
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -126,7 +127,19 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
-    for i in 0..8 {
+    GucRegistry::define_int_guc(
+        c"stat_pg.workers",
+        c"Number of aggregation workers",
+        c"The number of background processes to spawn for UDP metric aggregation.",
+        &WORKERS,
+        1,
+        16,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    let num_workers = WORKERS.get();
+    for i in 0..num_workers {
         BackgroundWorkerBuilder::new(&format!("stat_pg_aggregator_{}", i))
             .set_function("stat_pg_main")
             .set_library("stat_pg")
