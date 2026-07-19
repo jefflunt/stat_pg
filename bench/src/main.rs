@@ -334,21 +334,34 @@ fn main() {
             let mut local_metrics = 0u64;
             let mut local_bytes = 0u64;
             
-            // 1. Prebuilt 1000 UDP packets (each containing 120 metric updates)
+            // 1. Prebuilt 1000 UDP packets (randomly alternating INT32 and FLOAT64 updates up to 1,440 bytes)
             let num_prebuilt = 1000;
             let mut prebuilt_packets = Vec::with_capacity(num_prebuilt);
             let mut batch_idx = thread_id as usize;
 
             for _ in 0..num_prebuilt {
                 let mut packet = Vec::with_capacity(1440);
-                for _ in 0..120 {
+                let mut updates = 0u32;
+                while packet.len() + 12 <= 1440 {
                     let metric_idx = batch_idx % unique_metrics as usize;
-                    let metric_id = metric_ids_clone[metric_idx];
-                    packet.extend_from_slice(&metric_id.to_le_bytes());
-                    packet.extend_from_slice(&1.0f64.to_le_bytes());
+                    let id = metric_ids_clone[metric_idx];
+                    
+                    // 50% chance of INT32 vs FLOAT64 format based on batch_idx
+                    if batch_idx % 2 == 0 {
+                        // INT32 format: set sign bit of id, pack 4-byte value
+                        let raw_id = id | (1 << 31);
+                        packet.extend_from_slice(&raw_id.to_le_bytes());
+                        let val_i32 = 1.0f64 as i32;
+                        packet.extend_from_slice(&val_i32.to_le_bytes());
+                    } else {
+                        // FLOAT64 format: positive id, pack 8-byte value
+                        packet.extend_from_slice(&id.to_le_bytes());
+                        packet.extend_from_slice(&1.0f64.to_le_bytes());
+                    }
+                    updates += 1;
                     batch_idx = batch_idx.wrapping_add(threads as usize);
                 }
-                prebuilt_packets.push(packet);
+                prebuilt_packets.push((packet, updates));
             }
 
             #[cfg(target_os = "linux")]
@@ -382,7 +395,7 @@ fn main() {
                     while running_clone.load(Ordering::Relaxed) {
                         for i in 0..batch_size {
                             let p_idx = (packet_idx + i) % num_prebuilt;
-                            let packet_bytes = &prebuilt_packets[p_idx];
+                            let (packet_bytes, _) = &prebuilt_packets[p_idx];
                             iovecs[i].iov_base = packet_bytes.as_ptr() as *mut libc::c_void;
                             iovecs[i].iov_len = packet_bytes.len();
 
@@ -401,11 +414,14 @@ fn main() {
 
                         if res >= 0 {
                             let sent_count = res as usize;
+                            for i in 0..sent_count {
+                                let p_idx = (packet_idx + i) % num_prebuilt;
+                                let (packet_bytes, updates) = &prebuilt_packets[p_idx];
+                                local_metrics += *updates as u64;
+                                local_bytes += packet_bytes.len() as u64;
+                            }
                             packet_idx = (packet_idx + sent_count) % num_prebuilt;
-                            
                             local_packets += sent_count as u64;
-                            local_metrics += (sent_count * 120) as u64;
-                            local_bytes += (sent_count * 1440) as u64;
                         } else {
                             let err = std::io::Error::last_os_error();
                             if err.kind() != std::io::ErrorKind::WouldBlock {
@@ -426,11 +442,11 @@ fn main() {
             } else {
                 let mut packet_idx = 0;
                 while running_clone.load(Ordering::Relaxed) {
-                    let packet_bytes = &prebuilt_packets[packet_idx];
+                    let (packet_bytes, updates) = &prebuilt_packets[packet_idx];
 
                     if socket.send(packet_bytes).is_ok() {
                         local_packets += 1;
-                        local_metrics += 120;
+                        local_metrics += *updates as u64;
                         local_bytes += packet_bytes.len() as u64;
                     } else {
                         break;

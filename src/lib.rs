@@ -491,16 +491,33 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     for i in 0..count {
                         let n = lengths[i];
                         let mut offset = 0;
-                        while offset + 12 <= n {
+                        while offset + 8 <= n {
                             let ptr = unsafe { bufs[i].as_ptr().add(offset) };
-                            let id = unsafe { std::ptr::read_unaligned(ptr as *const i32) };
-                            let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const f64) };
-                            if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-                                unsafe {
-                                    *active.get_unchecked_mut(id as usize) += value;
+                            let raw_id = unsafe { std::ptr::read_unaligned(ptr as *const i32) };
+                            if raw_id < 0 {
+                                // INT32 format (8 bytes total)
+                                let id = raw_id & 0x7FFFFFFF;
+                                let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const i32) } as f64;
+                                if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
+                                    unsafe {
+                                        *active.get_unchecked_mut(id as usize) += value;
+                                    }
                                 }
+                                offset += 8;
+                            } else {
+                                // FLOAT64 format (12 bytes total)
+                                if offset + 12 > n {
+                                    break;
+                                }
+                                let id = raw_id;
+                                let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const f64) };
+                                if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
+                                    unsafe {
+                                        *active.get_unchecked_mut(id as usize) += value;
+                                    }
+                                }
+                                offset += 12;
                             }
-                            offset += 12;
                         }
                     }
 
@@ -511,16 +528,33 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                                 for i in 0..drain_count {
                                     let n = lengths[i];
                                     let mut offset = 0;
-                                    while offset + 12 <= n {
+                                    while offset + 8 <= n {
                                         let ptr = unsafe { bufs[i].as_ptr().add(offset) };
-                                        let id = unsafe { std::ptr::read_unaligned(ptr as *const i32) };
-                                        let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const f64) };
-                                        if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-                                            unsafe {
-                                                *active.get_unchecked_mut(id as usize) += value;
+                                        let raw_id = unsafe { std::ptr::read_unaligned(ptr as *const i32) };
+                                        if raw_id < 0 {
+                                            // INT32 format (8 bytes total)
+                                            let id = raw_id & 0x7FFFFFFF;
+                                            let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const i32) } as f64;
+                                            if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
+                                                unsafe {
+                                                    *active.get_unchecked_mut(id as usize) += value;
+                                                }
                                             }
+                                            offset += 8;
+                                        } else {
+                                            // FLOAT64 format (12 bytes total)
+                                            if offset + 12 > n {
+                                                break;
+                                            }
+                                            let id = raw_id;
+                                            let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const f64) };
+                                            if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
+                                                unsafe {
+                                                    *active.get_unchecked_mut(id as usize) += value;
+                                                }
+                                            }
+                                            offset += 12;
                                         }
-                                        offset += 12;
                                     }
                                 }
                             }
