@@ -216,6 +216,111 @@ fn flush_table_slice(
 
 
 
+#[cfg(target_os = "linux")]
+fn recvmmsg_sys(
+    socket: &std::net::UdpSocket,
+    bufs: &mut [[u8; 2048]],
+    lengths: &mut [usize],
+    nonblocking: bool,
+) -> std::io::Result<usize> {
+    use std::os::unix::io::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let num_buffers = bufs.len();
+
+    let mut iovecs: Vec<libc::iovec> = bufs.iter_mut().map(|buf| {
+        libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        }
+    }).collect();
+
+    let mut mmsg: Vec<libc::mmsghdr> = iovecs.iter_mut().map(|iov| {
+        libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: iov as *mut libc::iovec,
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            msg_len: 0,
+        }
+    }).collect();
+
+    let flags = if nonblocking { libc::MSG_DONTWAIT } else { 0 };
+
+    let res = unsafe {
+        libc::recvmmsg(
+            fd,
+            mmsg.as_mut_ptr(),
+            num_buffers as libc::c_uint,
+            flags,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if res < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(0);
+        }
+        return Err(err);
+    }
+
+    let count = res as usize;
+    for i in 0..count {
+        lengths[i] = mmsg[i].msg_len as usize;
+    }
+
+    Ok(count)
+}
+
+#[cfg(target_os = "linux")]
+fn recv_batch_blocking(
+    socket: &std::net::UdpSocket,
+    bufs: &mut [[u8; 2048]],
+    lengths: &mut [usize],
+) -> std::io::Result<usize> {
+    recvmmsg_sys(socket, bufs, lengths, false)
+}
+
+#[cfg(target_os = "linux")]
+fn recv_batch_nonblocking(
+    socket: &std::net::UdpSocket,
+    bufs: &mut [[u8; 2048]],
+    lengths: &mut [usize],
+) -> std::io::Result<usize> {
+    recvmmsg_sys(socket, bufs, lengths, true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recv_batch_blocking(
+    socket: &std::net::UdpSocket,
+    bufs: &mut [[u8; 2048]],
+    lengths: &mut [usize],
+) -> std::io::Result<usize> {
+    match socket.recv_from(&mut bufs[0]) {
+        Ok((n, _src)) => {
+            lengths[0] = n;
+            Ok(1)
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recv_batch_nonblocking(
+    _socket: &std::net::UdpSocket,
+    _bufs: &mut [[u8; 2048]],
+    _lengths: &mut [usize],
+) -> std::io::Result<usize> {
+    // Non-blocking fallback is not used on non-Linux systems to avoid fcntl overhead
+    Ok(0)
+}
+
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
@@ -316,35 +421,55 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
             return;
         }
 
-        let mut buf = vec![0u8; 65536];
+        let mut bufs = vec![[0u8; 2048]; 32];
+        let mut lengths = vec![0; 32];
 
         while running_thread.load(Ordering::Relaxed) {
-            match socket.recv_from(&mut buf) {
-                Ok((n, _src)) => {
+            match recv_batch_blocking(&socket, &mut bufs, &mut lengths) {
+                Ok(count) if count > 0 => {
                     let mut active = active_buffer_clone.lock().unwrap();
                     let max_id = max_valid_id_clone.load(Ordering::Relaxed) as usize;
 
-                    // Parse 12-byte metric updates: [ID (4B LE i32)] [Value (8B LE f64)]
-                    let mut offset = 0;
-                    while offset + 12 <= n {
-                        let id_bytes = &buf[offset..offset + 4];
-                        let val_bytes = &buf[offset + 4..offset + 12];
-                        
-                        let id = i32::from_le_bytes(id_bytes.try_into().unwrap());
-                        let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
-
-                        if id > 0 && (id as usize) <= max_id {
-                            if (id as usize) < active.len() {
+                    // Process the first batch
+                    for i in 0..count {
+                        let n = lengths[i];
+                        let mut offset = 0;
+                        while offset + 12 <= n {
+                            let id_bytes = &bufs[i][offset..offset + 4];
+                            let val_bytes = &bufs[i][offset + 4..offset + 12];
+                            let id = i32::from_le_bytes(id_bytes.try_into().unwrap());
+                            let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
+                            if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
                                 active[id as usize] += value;
                             }
+                            offset += 12;
                         }
-                        offset += 12;
+                    }
+
+                    // Drain loop: fetch any other packets in the queue using non-blocking calls
+                    loop {
+                        match recv_batch_nonblocking(&socket, &mut bufs, &mut lengths) {
+                            Ok(drain_count) if drain_count > 0 => {
+                                for i in 0..drain_count {
+                                    let n = lengths[i];
+                                    let mut offset = 0;
+                                    while offset + 12 <= n {
+                                        let id_bytes = &bufs[i][offset..offset + 4];
+                                        let val_bytes = &bufs[i][offset + 4..offset + 12];
+                                        let id = i32::from_le_bytes(id_bytes.try_into().unwrap());
+                                        let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
+                                        if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
+                                            active[id as usize] += value;
+                                        }
+                                        offset += 12;
+                                    }
+                                }
+                            }
+                            _ => break,
+                        }
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Timeout, loop to check running state
-                }
-                Err(_) => {}
+                _ => {} // Timeout or error, loop again to check running state
             }
         }
     });

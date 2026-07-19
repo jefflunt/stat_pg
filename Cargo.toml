@@ -24,6 +24,7 @@ crossbeam-channel = "0.5"
 rtrb = "0.3"
 socket2 = "0.5"
 pprof = { version = "0.13", features = ["flamegraph"] }
+libc = "0.2"
 
 [dependencies.pgrx-bench]
 version = "=0.19.1"
