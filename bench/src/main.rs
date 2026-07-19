@@ -318,40 +318,118 @@ fn main() {
             let mut local_metrics = 0u64;
             let mut local_bytes = 0u64;
             
-            // Batch size: 100 updates * 12 bytes = 1200 bytes
-            let mut write_buf = Vec::with_capacity(1200);
+            // 1. Prebuilt 1000 UDP packets (each containing 100 metric updates)
+            let num_prebuilt = 1000;
+            let mut prebuilt_packets = Vec::with_capacity(num_prebuilt);
             let mut batch_idx = thread_id as usize;
 
-            while running_clone.load(Ordering::Relaxed) {
-                write_buf.clear();
-
-                let mut metrics_in_batch = 0;
+            for _ in 0..num_prebuilt {
+                let mut packet = Vec::with_capacity(1200);
                 for _ in 0..100 {
                     let metric_idx = batch_idx % unique_metrics as usize;
                     let metric_id = metric_ids_clone[metric_idx];
-
-                    write_buf.extend_from_slice(&metric_id.to_le_bytes());
-                    write_buf.extend_from_slice(&1.0f64.to_le_bytes());
-
+                    packet.extend_from_slice(&metric_id.to_le_bytes());
+                    packet.extend_from_slice(&1.0f64.to_le_bytes());
                     batch_idx = batch_idx.wrapping_add(threads as usize);
-                    metrics_in_batch += 1;
                 }
+                prebuilt_packets.push(packet);
+            }
 
-                if socket.send(&write_buf).is_ok() {
-                    local_packets += 1;
-                    local_metrics += metrics_in_batch;
-                    local_bytes += write_buf.len() as u64;
-                } else {
-                    break;
+            #[cfg(target_os = "linux")]
+            let run_linux = true;
+            #[cfg(not(target_os = "linux"))]
+            let run_linux = false;
+
+            if run_linux {
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = socket.as_raw_fd();
+                    let batch_size = 32;
+
+                    let mut iovecs = vec![libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; batch_size];
+                    let mut mmsgs = vec![libc::mmsghdr {
+                        msg_hdr: libc::msghdr {
+                            msg_name: std::ptr::null_mut(),
+                            msg_namelen: 0,
+                            msg_iov: std::ptr::null_mut(),
+                            msg_iovlen: 0,
+                            msg_control: std::ptr::null_mut(),
+                            msg_controllen: 0,
+                            msg_flags: 0,
+                        },
+                        msg_len: 0,
+                    }; batch_size];
+
+                    let mut packet_idx = 0;
+
+                    while running_clone.load(Ordering::Relaxed) {
+                        for i in 0..batch_size {
+                            let p_idx = (packet_idx + i) % num_prebuilt;
+                            let packet_bytes = &prebuilt_packets[p_idx];
+                            iovecs[i].iov_base = packet_bytes.as_ptr() as *mut libc::c_void;
+                            iovecs[i].iov_len = packet_bytes.len();
+
+                            mmsgs[i].msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+                            mmsgs[i].msg_hdr.msg_iovlen = 1;
+                        }
+
+                        let res = unsafe {
+                            libc::sendmmsg(
+                                fd,
+                                mmsgs.as_mut_ptr(),
+                                batch_size as libc::c_uint,
+                                0,
+                            )
+                        };
+
+                        if res >= 0 {
+                            let sent_count = res as usize;
+                            packet_idx = (packet_idx + sent_count) % num_prebuilt;
+                            
+                            local_packets += sent_count as u64;
+                            local_metrics += (sent_count * 100) as u64;
+                            local_bytes += (sent_count * 1200) as u64;
+                        } else {
+                            let err = std::io::Error::last_os_error();
+                            if err.kind() != std::io::ErrorKind::WouldBlock {
+                                break;
+                            }
+                        }
+
+                        if local_packets % 320 == 0 {
+                            packets_clone.fetch_add(local_packets, Ordering::Relaxed);
+                            metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
+                            bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
+                            local_packets = 0;
+                            local_metrics = 0;
+                            local_bytes = 0;
+                        }
+                    }
                 }
+            } else {
+                let mut packet_idx = 0;
+                while running_clone.load(Ordering::Relaxed) {
+                    let packet_bytes = &prebuilt_packets[packet_idx];
 
-                if local_packets % 100 == 0 {
-                    packets_clone.fetch_add(local_packets, Ordering::Relaxed);
-                    metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
-                    bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
-                    local_packets = 0;
-                    local_metrics = 0;
-                    local_bytes = 0;
+                    if socket.send(packet_bytes).is_ok() {
+                        local_packets += 1;
+                        local_metrics += 100;
+                        local_bytes += packet_bytes.len() as u64;
+                    } else {
+                        break;
+                    }
+
+                    packet_idx = (packet_idx + 1) % num_prebuilt;
+
+                    if local_packets % 100 == 0 {
+                        packets_clone.fetch_add(local_packets, Ordering::Relaxed);
+                        metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
+                        bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
+                        local_packets = 0;
+                        local_metrics = 0;
+                        local_bytes = 0;
+                    }
                 }
             }
 
