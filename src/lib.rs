@@ -269,10 +269,36 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
 
     thread::spawn(move || {
         let socket_addr = format!("{}:{}", bind_addr, port);
-        let socket = match UdpSocket::bind(&socket_addr) {
-            Ok(s) => {
+        let addr: std::net::SocketAddr = match socket_addr.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("stat-pg: failed to parse socket address {}: {}", socket_addr, e);
+                return;
+            }
+        };
+
+        let socket = match socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("stat-pg: failed to create socket: {}", e);
+                return;
+            }
+        };
+
+        let _ = socket.set_reuse_address(true);
+        if let Err(e) = socket.set_recv_buffer_size(256 * 1024 * 1024) {
+            eprintln!("stat-pg: failed to set UDP receive buffer size (using OS max): {}", e);
+        }
+
+        let socket = match socket.bind(&addr.into()) {
+            Ok(_) => {
+                let std_sock: std::net::UdpSocket = socket.into();
                 eprintln!("stat-pg: bound UDP listener to {}", socket_addr);
-                s
+                std_sock
             }
             Err(e) => {
                 eprintln!("stat-pg: failed to bind UDP listener to {}: {}", socket_addr, e);

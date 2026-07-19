@@ -261,6 +261,9 @@ fn main() {
     };
     let name_to_id = Arc::new(name_to_id);
 
+    println!("Warmup: Waiting 2.0 seconds for background worker to sync MAX(id) bounds...");
+    std::thread::sleep(Duration::from_secs(2));
+
     let start_time = Instant::now();
     let mut worker_handles = Vec::with_capacity(threads as usize);
 
