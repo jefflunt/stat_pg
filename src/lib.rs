@@ -268,28 +268,28 @@ fn recvmmsg_sys(
     use std::os::unix::io::AsRawFd;
     let fd = socket.as_raw_fd();
     let num_buffers = bufs.len();
+    assert!(num_buffers <= 32, "recvmmsg_sys only supports up to 32 buffers");
 
-    let mut iovecs: Vec<libc::iovec> = bufs.iter_mut().map(|buf| {
-        libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        }
-    }).collect();
+    let mut iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 32];
+    let mut mmsg = [libc::mmsghdr {
+        msg_hdr: libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: std::ptr::null_mut(),
+            msg_iovlen: 0,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        },
+        msg_len: 0,
+    }; 32];
 
-    let mut mmsg: Vec<libc::mmsghdr> = iovecs.iter_mut().map(|iov| {
-        libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: iov as *mut libc::iovec,
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        }
-    }).collect();
+    for i in 0..num_buffers {
+        iovecs[i].iov_base = bufs[i].as_mut_ptr() as *mut libc::c_void;
+        iovecs[i].iov_len = bufs[i].len();
+        mmsg[i].msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+        mmsg[i].msg_hdr.msg_iovlen = 1;
+    }
 
     let flags = if nonblocking { libc::MSG_DONTWAIT } else { 0 };
 
@@ -492,12 +492,13 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                         let n = lengths[i];
                         let mut offset = 0;
                         while offset + 12 <= n {
-                            let id_bytes = &bufs[i][offset..offset + 4];
-                            let val_bytes = &bufs[i][offset + 4..offset + 12];
-                            let id = i32::from_le_bytes(id_bytes.try_into().unwrap());
-                            let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
+                            let ptr = unsafe { bufs[i].as_ptr().add(offset) };
+                            let id = unsafe { std::ptr::read_unaligned(ptr as *const i32) };
+                            let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const f64) };
                             if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-                                active[id as usize] += value;
+                                unsafe {
+                                    *active.get_unchecked_mut(id as usize) += value;
+                                }
                             }
                             offset += 12;
                         }
@@ -511,12 +512,13 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                                     let n = lengths[i];
                                     let mut offset = 0;
                                     while offset + 12 <= n {
-                                        let id_bytes = &bufs[i][offset..offset + 4];
-                                        let val_bytes = &bufs[i][offset + 4..offset + 12];
-                                        let id = i32::from_le_bytes(id_bytes.try_into().unwrap());
-                                        let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
+                                        let ptr = unsafe { bufs[i].as_ptr().add(offset) };
+                                        let id = unsafe { std::ptr::read_unaligned(ptr as *const i32) };
+                                        let value = unsafe { std::ptr::read_unaligned(ptr.add(4) as *const f64) };
                                         if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-                                            active[id as usize] += value;
+                                            unsafe {
+                                                *active.get_unchecked_mut(id as usize) += value;
+                                            }
                                         }
                                         offset += 12;
                                     }
