@@ -123,7 +123,7 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
-    for i in 0..4 {
+    for i in 0..8 {
         BackgroundWorkerBuilder::new(&format!("stat_pg_aggregator_{}", i))
             .set_function("stat_pg_main")
             .set_library("stat_pg")
