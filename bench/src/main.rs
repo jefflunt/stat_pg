@@ -191,7 +191,7 @@ fn main() {
     println!("Sender Threads : {}", threads);
     println!("Run Duration   : {} seconds ({:.1} minutes)", duration_secs, duration_secs as f64 / 60.0);
     println!("Unique Metrics : {}", unique_metrics);
-    println!("Protocol Format: Raw UDP (12-byte packets)");
+    println!("Protocol Format: Raw UDP (12-byte updates, 120 updates/packet)");
     println!("==================================================");
 
     // Atomic states shared across sender threads
@@ -334,14 +334,14 @@ fn main() {
             let mut local_metrics = 0u64;
             let mut local_bytes = 0u64;
             
-            // 1. Prebuilt 1000 UDP packets (each containing 100 metric updates)
+            // 1. Prebuilt 1000 UDP packets (each containing 120 metric updates)
             let num_prebuilt = 1000;
             let mut prebuilt_packets = Vec::with_capacity(num_prebuilt);
             let mut batch_idx = thread_id as usize;
 
             for _ in 0..num_prebuilt {
-                let mut packet = Vec::with_capacity(1200);
-                for _ in 0..100 {
+                let mut packet = Vec::with_capacity(1440);
+                for _ in 0..120 {
                     let metric_idx = batch_idx % unique_metrics as usize;
                     let metric_id = metric_ids_clone[metric_idx];
                     packet.extend_from_slice(&metric_id.to_le_bytes());
@@ -404,8 +404,8 @@ fn main() {
                             packet_idx = (packet_idx + sent_count) % num_prebuilt;
                             
                             local_packets += sent_count as u64;
-                            local_metrics += (sent_count * 100) as u64;
-                            local_bytes += (sent_count * 1200) as u64;
+                            local_metrics += (sent_count * 120) as u64;
+                            local_bytes += (sent_count * 1440) as u64;
                         } else {
                             let err = std::io::Error::last_os_error();
                             if err.kind() != std::io::ErrorKind::WouldBlock {
@@ -430,7 +430,7 @@ fn main() {
 
                     if socket.send(packet_bytes).is_ok() {
                         local_packets += 1;
-                        local_metrics += 100;
+                        local_metrics += 120;
                         local_bytes += packet_bytes.len() as u64;
                     } else {
                         break;
@@ -438,7 +438,7 @@ fn main() {
 
                     packet_idx = (packet_idx + 1) % num_prebuilt;
 
-                    if local_packets % 100 == 0 {
+                    if local_packets % 120 == 0 {
                         packets_clone.fetch_add(local_packets, Ordering::Relaxed);
                         metrics_clone.fetch_add(local_metrics, Ordering::Relaxed);
                         bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
@@ -491,7 +491,7 @@ fn main() {
     println!("Total Packets  : {}", format_number(total_packets));
     println!("Total Metrics  : {}", format_number(total_metrics));
     println!("Total Bytes    : {:.2} MB", total_bytes as f64 / 1_048_576.0);
-    println!("Average PPS    : {} Batches/sec (100 updates/batch)", format_float(pps));
+    println!("Average PPS    : {} Batches/sec (120 updates/batch)", format_float(pps));
     println!("Average MPS    : {} Metrics/sec (Ingested)", format_number(mps));
     println!("Throughput     : {:.2} MB/sec", mb_sec);
     println!("==================================================");
