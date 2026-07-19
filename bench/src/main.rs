@@ -238,36 +238,36 @@ fn main() {
     let host_clone = host.clone();
     let query_thread = thread::spawn(move || {
         let mut run = 1;
-        let mut previous_sum = 0.0;
+        let mut previous_processed = 0u64;
         let mut stable_seconds = 0;
 
         loop {
             thread::sleep(Duration::from_secs(15));
             
             let start = Instant::now();
-            let output = run_psql_query(&host_clone, "SELECT COALESCE(SUM(value::float8), 0.0) FROM evt_secs;", true);
+            let output = run_psql_query(&host_clone, "SELECT COALESCE(SUM(count), 0) FROM stat_pg_processed;", true);
             
             let duration = start.elapsed();
             
-            let mut current_sum = 0.0;
+            let mut current_processed = 0u64;
             match output {
                 Ok(out) => {
                     if out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
-                        current_sum = stdout.trim().parse().unwrap_or(0.0);
+                        current_processed = stdout.trim().parse().unwrap_or(0);
                     }
                 }
                 Err(_) => {}
             }
 
             println!(
-                "SQL Monitor Run {:<4} | SUM(value): {:<15} (Query took {:.2?})",
+                "SQL Monitor Run {:<4} | Processed: {:<15} (Query took {:.2?})",
                 run,
-                format_number(current_sum as u64),
+                format_number(current_processed),
                 duration
             );
 
-            if current_sum == previous_sum && current_sum > 0.0 {
+            if current_processed == previous_processed && current_processed > 0 {
                 stable_seconds += 15;
                 if stable_seconds >= 15 {
                     println!("\nDatabase inserts have stabilized. Ingestion queue is fully drained!");
@@ -277,7 +277,7 @@ fn main() {
                 stable_seconds = 0;
             }
 
-            previous_sum = current_sum;
+            previous_processed = current_processed;
             run += 1;
         }
     });
