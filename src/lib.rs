@@ -315,6 +315,9 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         while running_thread.load(Ordering::Relaxed) {
             match socket.recv_from(&mut buf) {
                 Ok((n, _src)) => {
+                    let mut active = active_buffer_clone.lock().unwrap();
+                    let max_id = max_valid_id_clone.load(Ordering::Relaxed) as usize;
+
                     // Parse 12-byte metric updates: [ID (4B LE i32)] [Value (8B LE f64)]
                     let mut offset = 0;
                     while offset + 12 <= n {
@@ -324,9 +327,7 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                         let id = i32::from_le_bytes(id_bytes.try_into().unwrap());
                         let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
 
-                        let max_id = max_valid_id_clone.load(Ordering::Relaxed) as usize;
                         if id > 0 && (id as usize) <= max_id {
-                            let mut active = active_buffer_clone.lock().unwrap();
                             if (id as usize) < active.len() {
                                 active[id as usize] += value;
                             }
