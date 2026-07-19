@@ -285,10 +285,13 @@ fn main() {
     let db_port = if host == "127.0.0.1" || host == "localhost" { 5433 } else { 5432 };
     let db_url = format!("postgres://postgres:postgres@{}:{}/postgres", host, db_port);
 
+    let mut initial_udp_received = 0i64;
+    let mut initial_udp_dropped = 0i64;
+
     // Automatically truncate and vacuum database tables before registering metrics
     println!("Database cleanup: Truncating event tables and vacuuming...");
     if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
-        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, evt_secs, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging, stat_pg_processed RESTART IDENTITY CASCADE;", &[]);
+        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, evt_secs, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups RESTART IDENTITY CASCADE;", &[]);
         let _ = client.execute("VACUUM ANALYZE;", &[]);
     }
 
@@ -310,6 +313,10 @@ fn main() {
         if let Ok(row) = client.query_one("SELECT COUNT(*) FROM stat_pg_metrics;", &[]) {
             let count: i64 = row.get(0);
             println!("Warmup check: Total registered metrics in database: {}", count);
+        }
+        if let Ok(row) = client.query_one("SELECT received, dropped FROM stat_pg_udp_stats();", &[]) {
+            initial_udp_received = row.get(0);
+            initial_udp_dropped = row.get(1);
         }
     }
 
@@ -802,6 +809,9 @@ fn main() {
     println!("Waiting for final background SQL query runs to finish and stabilize...");
     let _ = query_thread.join();
 
+    println!("Forcing final cascading database rollups to complete...");
+    let _ = run_psql_query(&host, "SELECT stat_pg_force_rollups();", false);
+
     // Perform comprehensive final database consistency validation
     println!("==================================================");
     println!("Performing Final Database Consistency Validation...");
@@ -831,6 +841,22 @@ fn main() {
         }
     }
 
+    let mut final_udp_received = 0i64;
+    let mut final_udp_dropped = 0i64;
+    let mut avg_merge_latency = 0.0f64;
+    if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
+        if let Ok(row) = client.query_one("SELECT received, dropped FROM stat_pg_udp_stats();", &[]) {
+            final_udp_received = row.get(0);
+            final_udp_dropped = row.get(1);
+        }
+        if let Ok(row) = client.query_one("SELECT COALESCE(SUM(total_latency_ms) / NULLIF(SUM(merge_count), 0), 0.0)::float8 FROM stat_pg_processed WHERE worker_id = 0;", &[]) {
+            avg_merge_latency = row.get(0);
+        }
+    }
+
+    let diff_udp_received = final_udp_received - initial_udp_received;
+    let diff_udp_dropped = final_udp_dropped - initial_udp_dropped;
+
     let target_sum = table_sums.get("evt_secs").cloned().unwrap_or(0.0);
     let delivery_rate = if total_sent > 0 {
         (total_processed as f64 / total_sent as f64) * 100.0
@@ -843,6 +869,16 @@ fn main() {
         format_number(total_processed), 
         delivery_rate
     );
+    println!("Average Coordinator Merge Time : {:.2} ms", avg_merge_latency);
+    println!("Kernel Network Ingestion Stats (Container):");
+    println!("  - Total UDP Packets Received   : {}", format_number(diff_udp_received as u64));
+    println!("  - Total UDP Packets Dropped    : {}", format_number(diff_udp_dropped as u64));
+    let udp_success_rate = if diff_udp_received + diff_udp_dropped > 0 {
+        (diff_udp_received as f64 / (diff_udp_received + diff_udp_dropped) as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!("  - Kernel Ingestion Success Rate: {:.2}%", udp_success_rate);
     println!("Persisted SUM(evt_secs)        : {}", format_number(target_sum as u64));
 
     let mut mismatch = false;
@@ -877,7 +913,8 @@ fn main() {
                 ('evt_hours'),
                 ('evt_days'),
                 ('evt_30s'),
-                ('stat_pg_processed')
+                ('stat_pg_processed'),
+                ('stat_pg_rollups')
         ) as t(table_name);
     ";
     let output = run_psql_query(&host, space_query, false);
