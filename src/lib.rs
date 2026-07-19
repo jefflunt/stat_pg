@@ -123,13 +123,15 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
-    BackgroundWorkerBuilder::new("stat_pg_aggregator")
-        .set_function("stat_pg_main")
-        .set_library("stat_pg")
-        .set_start_time(BgWorkerStartTime::PostmasterStart)
-        .set_restart_time(Some(Duration::from_secs(10)))
-        .enable_spi_access()
-        .load();
+    for i in 0..4 {
+        BackgroundWorkerBuilder::new(&format!("stat_pg_aggregator_{}", i))
+            .set_function("stat_pg_main")
+            .set_library("stat_pg")
+            .set_start_time(BgWorkerStartTime::PostmasterStart)
+            .set_restart_time(Some(Duration::from_secs(10)))
+            .enable_spi_access()
+            .load();
+    }
 }
 
 
@@ -400,6 +402,20 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         };
 
         let _ = socket.set_reuse_address(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let optval: libc::c_int = 1;
+            let _ = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
+                    &optval as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+        }
         if let Err(e) = socket.set_recv_buffer_size(256 * 1024 * 1024) {
             eprintln!("stat-pg: failed to set UDP receive buffer size (using OS max): {}", e);
         }
