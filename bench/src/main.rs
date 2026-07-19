@@ -251,6 +251,13 @@ fn main() {
     let db_port = if host == "127.0.0.1" || host == "localhost" { 5433 } else { 5432 };
     let db_url = format!("postgres://postgres:postgres@{}:{}/postgres", host, db_port);
 
+    // Automatically truncate and vacuum database tables before registering metrics
+    println!("Database cleanup: Truncating event tables and vacuuming...");
+    if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
+        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, evt_secs, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging RESTART IDENTITY CASCADE;", &[]);
+        let _ = client.execute("VACUUM ANALYZE;", &[]);
+    }
+
     // Register all simulated metric names in the database and retrieve their IDs
     let name_to_id = match register_metrics(&db_url, unique_metrics) {
         Ok(m) => m,

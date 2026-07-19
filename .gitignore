@@ -28,4 +28,4 @@ log/
 *.so
 *.dylib
 *.dll
-flamegraph.svg
+flamegraph*.svg

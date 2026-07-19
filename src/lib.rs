@@ -2,8 +2,6 @@ use pgrx::bgworkers::*;
 use pgrx::prelude::*;
 use pgrx::guc::*;
 use pgrx::spi::SpiClient;
-use pgrx::datum::DatumWithOid;
-use crate::pg_sys::PgOid;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,6 +46,11 @@ extension_sql!(
         at BIGINT NOT NULL,
         value DECIMAL(20, 12) NOT NULL,
         PRIMARY KEY (at, metric_id)
+    );
+    CREATE UNLOGGED TABLE IF NOT EXISTS stat_pg_staging (
+        metric_id INT NOT NULL,
+        at BIGINT NOT NULL,
+        value DECIMAL(20, 12) NOT NULL
     );
     "#,
     name = "create_evt_tables"
@@ -129,6 +132,7 @@ pub extern "C-unwind" fn _PG_init() {
             .set_library("stat_pg")
             .set_start_time(BgWorkerStartTime::PostmasterStart)
             .set_restart_time(Some(Duration::from_secs(10)))
+            .set_argument(Some(pg_sys::Datum::from(i as usize)))
             .enable_spi_access()
             .load();
     }
@@ -146,73 +150,91 @@ fn flush_slot(client: &mut SpiClient<'_>, ts: i64, data: &[f64]) -> Result<(), p
     if active_entries.is_empty() {
         return Ok(());
     }
+
+    let pid = std::process::id();
+    let filename = format!("/tmp/flush_{}.csv", pid);
     
-    // Aggregate values to all rollup periods and flush
-    flush_table_slice(client, "evt_secs", ts, &active_entries)?;
-    flush_table_slice(client, "evt_mins", ts / 60, &active_entries)?;
-    flush_table_slice(client, "evt_hours", ts / 3600, &active_entries)?;
-    flush_table_slice(client, "evt_days", ts / 86400, &active_entries)?;
-    flush_table_slice(client, "evt_30s", ts / 2592000, &active_entries)?;
+    use std::io::{BufWriter, Write};
+    if let Ok(file) = std::fs::File::create(&filename) {
+        let mut writer = BufWriter::new(file);
+        for (metric_id, value) in active_entries {
+            let _ = writeln!(writer, "{},{},{}", metric_id, ts, value);
+        }
+        let _ = writer.flush();
+    }
+
+    let copy_query = format!(
+        "COPY stat_pg_staging (metric_id, at, value) FROM '{}' WITH (FORMAT csv);",
+        filename
+    );
+    client.update(&copy_query, None, &[])?;
+
+    let _ = std::fs::remove_file(&filename);
 
     Ok(())
 }
 
-fn make_batch_insert_query(table_name: &str, batch_size: usize) -> String {
-    let mut sql = format!("INSERT INTO {} (metric_id, at, value) VALUES ", table_name);
-    for i in 0..batch_size {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        let base = i * 3;
-        sql.push_str(&format!("(${}, ${}, ${})", base + 1, base + 2, base + 3));
+fn coordinator_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
+    let has_data: bool = client.select(
+        "SELECT EXISTS (SELECT FROM stat_pg_staging LIMIT 1);",
+        None, &[]
+    )?.first().get_one()?.unwrap_or(false);
+
+    if !has_data {
+        return Ok(());
     }
-    sql.push_str(&format!(
-        " ON CONFLICT (at, metric_id) DO UPDATE SET value = {}.value + EXCLUDED.value;",
-        table_name
-    ));
-    sql
-}
 
-fn flush_table_slice(
-    client: &mut SpiClient<'_>,
-    table_name: &str,
-    ts: i64,
-    entries: &[(i32, f64)],
-) -> Result<(), pgrx::spi::Error> {
-    let mut index = 0;
-    let total = entries.len();
-    let chunks = [5000, 500, 1];
+    // 1. Snapshot the staging table into a temporary table and truncate staging immediately
+    client.update(
+        "CREATE TEMPORARY TABLE stat_pg_temp ON COMMIT DROP AS
+         SELECT metric_id, at, value FROM stat_pg_staging;",
+        None, &[]
+    )?;
+    client.update("TRUNCATE stat_pg_staging;", None, &[])?;
 
-    for &chunk_size in &chunks {
-        if index >= total {
-            break;
-        }
+    // 2. Merge into evt_secs from temp table
+    client.update(
+        "INSERT INTO evt_secs (metric_id, at, value)
+         SELECT metric_id, at, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at
+         ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_secs.value + EXCLUDED.value;",
+        None, &[]
+    )?;
 
-        if index + chunk_size <= total {
-            let sql = make_batch_insert_query(table_name, chunk_size);
-            
-            let mut arg_types = Vec::with_capacity(chunk_size * 3);
-            for _ in 0..chunk_size {
-                arg_types.push(PgOid::from(pg_sys::INT4OID));
-                arg_types.push(PgOid::from(pg_sys::INT8OID));
-                arg_types.push(PgOid::from(pg_sys::FLOAT8OID));
-            }
+    // 3. Merge into evt_mins from temp table
+    client.update(
+        "INSERT INTO evt_mins (metric_id, at, value)
+         SELECT metric_id, at / 60, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 60
+         ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_mins.value + EXCLUDED.value;",
+        None, &[]
+    )?;
 
-            let prepared = client.prepare_mut(&sql, &arg_types)?;
+    // 4. Merge into evt_hours from temp table
+    client.update(
+        "INSERT INTO evt_hours (metric_id, at, value)
+         SELECT metric_id, at / 3600, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 3600
+         ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_hours.value + EXCLUDED.value;",
+        None, &[]
+    )?;
 
-            while index + chunk_size <= total {
-                let mut args = Vec::with_capacity(chunk_size * 3);
-                for i in 0..chunk_size {
-                    let (metric_id, value) = entries[index + i];
-                    args.push(DatumWithOid::from(metric_id));
-                    args.push(DatumWithOid::from(ts));
-                    args.push(DatumWithOid::from(value));
-                }
-                client.update(&prepared, None, &args)?;
-                index += chunk_size;
-            }
-        }
-    }
+    // 5. Merge into evt_days from temp table
+    client.update(
+        "INSERT INTO evt_days (metric_id, at, value)
+         SELECT metric_id, at / 86400, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 86400
+         ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_days.value + EXCLUDED.value;",
+        None, &[]
+    )?;
+
+    // 6. Merge into evt_30s from temp table
+    client.update(
+        "INSERT INTO evt_30s (metric_id, at, value)
+         SELECT metric_id, at / 2592000, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 2592000
+         ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_30s.value + EXCLUDED.value;",
+        None, &[]
+    )?;
+
+    // 7. Clean up temporary table
+    client.update("DROP TABLE stat_pg_temp;", None, &[])?;
+
     Ok(())
 }
 
@@ -327,6 +349,7 @@ fn recv_batch_nonblocking(
 #[no_mangle]
 pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    let worker_index = usize::from(_arg) as i32;
 
     let mut guard = pprof::ProfilerGuardBuilder::default()
         .frequency(99)
@@ -497,8 +520,8 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         if unsafe { pgrx::pg_sys::ShutdownRequestPending } != 0 {
             if let Some(g) = guard.take() {
                 if let Ok(report) = g.report().build() {
-                    let file_path = "/workspace/flamegraph.svg";
-                    if let Ok(file) = std::fs::File::create(file_path) {
+                    let file_path = format!("/workspace/flamegraph_{}.svg", std::process::id());
+                    if let Ok(file) = std::fs::File::create(&file_path) {
                         let _ = report.flamegraph(file);
                     }
                 }
@@ -550,6 +573,11 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     // 2. Flush slot data
                     flush_slot(client, at, &local_flush_buffer)?;
 
+                    // 3. Coordinator worker merges staging table into rollup tables
+                    if worker_index == 0 {
+                        coordinator_merge(client)?;
+                    }
+
                     Ok::<(), pgrx::spi::Error>(())
                 })
             });
@@ -571,8 +599,8 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     running.store(false, Ordering::Relaxed);
     if let Some(g) = guard.take() {
         if let Ok(report) = g.report().build() {
-            let file_path = "/workspace/flamegraph.svg";
-            if let Ok(file) = std::fs::File::create(file_path) {
+            let file_path = format!("/workspace/flamegraph_{}.svg", std::process::id());
+            if let Ok(file) = std::fs::File::create(&file_path) {
                 let _ = report.flamegraph(file);
             }
         }
@@ -598,6 +626,7 @@ mod tests {
             // 2. Perform aggregate flush of a slot
             let data = vec![0.0, 4.5]; // index 1 is test_metric
             crate::flush_slot(client, 1000, &data).expect("Flush slot failed");
+            crate::coordinator_merge(client).expect("Merge failed");
 
             // Query check for seconds
             let val = client.select(
@@ -614,6 +643,7 @@ mod tests {
             // Upsert (conflict update) check
             let data2 = vec![0.0, 5.5];
             crate::flush_slot(client, 1000, &data2).expect("Flush slot failed");
+            crate::coordinator_merge(client).expect("Merge failed");
 
             // Query check again (value should be aggregated: 4.5 + 5.5 = 10.0)
             let val2 = client.select(
@@ -630,17 +660,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod unit_tests {
-    #[test]
-    fn test_make_batch_insert_query() {
-        let query = crate::make_batch_insert_query("evt_secs", 2);
-        assert_eq!(
-            query,
-            "INSERT INTO evt_secs (metric_id, at, value) VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_secs.value + EXCLUDED.value;"
-        );
-    }
-}
+
 
 #[cfg(test)]
 pub mod pg_test {
