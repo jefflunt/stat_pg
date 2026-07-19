@@ -402,96 +402,100 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
         let format = unsafe { *ptr };
         let id = unsafe { std::ptr::read_unaligned(ptr.add(1) as *const i16) } as i32;
 
-        let value: f64;
-        let width: usize;
-
-        match format {
-            0 => {
-                value = 1.0;
-                width = 3;
-            }
-            1 => {
-                value = -1.0;
-                width = 3;
-            }
-            2 => {
-                if offset + 4 > n { break; }
-                let val = unsafe { *(ptr.add(3) as *const i8) };
-                value = val as f64;
-                width = 4;
-            }
-            3 => {
-                if offset + 4 > n { break; }
-                let val = unsafe { *(ptr.add(3) as *const u8) };
-                value = val as f64;
-                width = 4;
-            }
-            4 => {
-                if offset + 5 > n { break; }
-                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i16) };
-                value = val as f64;
-                width = 5;
-            }
-            5 => {
-                if offset + 5 > n { break; }
-                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u16) };
-                value = val as f64;
-                width = 5;
-            }
-            6 | 7 => {
-                if offset + 5 > n { break; }
-                let val_bits = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u16) };
-                value = f16_to_f64(val_bits);
-                width = 5;
-            }
-            8 => {
-                if offset + 7 > n { break; }
-                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i32) };
-                value = val as f64;
-                width = 7;
-            }
-            9 => {
-                if offset + 7 > n { break; }
-                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u32) };
-                value = val as f64;
-                width = 7;
-            }
-            10 | 11 => {
-                if offset + 7 > n { break; }
-                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const f32) };
-                value = val as f64;
-                width = 7;
-            }
-            12 => {
-                if offset + 11 > n { break; }
-                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i64) };
-                value = val as f64;
-                width = 11;
-            }
-            13 => {
-                if offset + 11 > n { break; }
-                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u64) };
-                value = val as f64;
-                width = 11;
-            }
-            14 | 15 => {
-                if offset + 11 > n { break; }
-                let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const f64) };
-                value = val;
-                width = 11;
-            }
-            _ => {
-                break;
-            }
-        }
-
         if id > 0 && (id as usize) <= max_id && (id as usize) < active.len() {
-            unsafe {
-                *active.get_unchecked_mut(id as usize) += value;
+            let active_ref = unsafe { active.get_unchecked_mut(id as usize) };
+            match format {
+                0 => {
+                    *active_ref += 1.0;
+                    offset += 3;
+                }
+                1 => {
+                    *active_ref -= 1.0;
+                    offset += 3;
+                }
+                2 => {
+                    if offset + 4 > n { break; }
+                    let val = unsafe { *(ptr.add(3) as *const i8) };
+                    *active_ref += val as f64;
+                    offset += 4;
+                }
+                3 => {
+                    if offset + 4 > n { break; }
+                    let val = unsafe { *(ptr.add(3) as *const u8) };
+                    *active_ref += val as f64;
+                    offset += 4;
+                }
+                4 => {
+                    if offset + 5 > n { break; }
+                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i16) };
+                    *active_ref += val as f64;
+                    offset += 5;
+                }
+                5 => {
+                    if offset + 5 > n { break; }
+                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u16) };
+                    *active_ref += val as f64;
+                    offset += 5;
+                }
+                6 | 7 => {
+                    if offset + 5 > n { break; }
+                    let val_bits = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u16) };
+                    *active_ref += f16_to_f64(val_bits);
+                    offset += 5;
+                }
+                8 => {
+                    if offset + 7 > n { break; }
+                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i32) };
+                    *active_ref += val as f64;
+                    offset += 7;
+                }
+                9 => {
+                    if offset + 7 > n { break; }
+                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u32) };
+                    *active_ref += val as f64;
+                    offset += 7;
+                }
+                10 | 11 => {
+                    if offset + 7 > n { break; }
+                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const f32) };
+                    *active_ref += val as f64;
+                    offset += 7;
+                }
+                12 => {
+                    if offset + 11 > n { break; }
+                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const i64) };
+                    *active_ref += val as f64;
+                    offset += 11;
+                }
+                13 => {
+                    if offset + 11 > n { break; }
+                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const u64) };
+                    *active_ref += val as f64;
+                    offset += 11;
+                }
+                14 | 15 => {
+                    if offset + 11 > n { break; }
+                    let val = unsafe { std::ptr::read_unaligned(ptr.add(3) as *const f64) };
+                    *active_ref += val;
+                    offset += 11;
+                }
+                _ => {
+                    break;
+                }
             }
             parsed_count += 1;
+        } else {
+            let width = match format {
+                0 | 1 => 3,
+                2 | 3 => 4,
+                4 | 5 | 6 | 7 => 5,
+                8 | 9 | 10 | 11 => 7,
+                12 | 13 | 14 | 15 => 11,
+                _ => break,
+            };
+            if offset + width > n { break; }
+            offset += width;
         }
-        offset += width;
     }
     parsed_count
 }
