@@ -221,6 +221,12 @@ fn flush_table_slice(
 pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
+    let mut guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(99)
+        .blocklist(&["libc", "libgcc", "pthread"])
+        .build()
+        .ok();
+
     let db_name = DB_NAME.get()
         .and_then(|c| c.into_string().ok())
         .unwrap_or_else(|| "postgres".to_string());
@@ -348,6 +354,14 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
 
     while BackgroundWorker::worker_continue() {
         if unsafe { pgrx::pg_sys::ShutdownRequestPending } != 0 {
+            if let Some(g) = guard.take() {
+                if let Ok(report) = g.report().build() {
+                    let file_path = "/workspace/flamegraph.svg";
+                    if let Ok(file) = std::fs::File::create(file_path) {
+                        let _ = report.flamegraph(file);
+                    }
+                }
+            }
             std::process::exit(0);
         }
         let now = SystemTime::now();
@@ -414,6 +428,14 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     }
 
     running.store(false, Ordering::Relaxed);
+    if let Some(g) = guard.take() {
+        if let Ok(report) = g.report().build() {
+            let file_path = "/workspace/flamegraph.svg";
+            if let Ok(file) = std::fs::File::create(file_path) {
+                let _ = report.flamegraph(file);
+            }
+        }
+    }
     log!("stat-pg background worker stopped");
 }
 
