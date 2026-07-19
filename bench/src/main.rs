@@ -309,6 +309,22 @@ fn main() {
                 }
             };
 
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = socket.as_raw_fd();
+                let val: libc::c_int = 50 * 1024 * 1024;
+                let _ = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        &val as *const libc::c_int as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    )
+                };
+            }
+
             if let Err(e) = socket.connect(&target) {
                 println!("Thread {} failed to connect UDP socket to {}: {}", thread_id, target, e);
                 return;
