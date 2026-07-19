@@ -209,6 +209,7 @@ fn coordinator_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error>
     client.update(
         "INSERT INTO evt_secs (metric_id, at, value)
          SELECT metric_id, at, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at
+         ORDER BY at, metric_id
          ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_secs.value + EXCLUDED.value;",
         None, &[]
     )?;
@@ -217,6 +218,7 @@ fn coordinator_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error>
     client.update(
         "INSERT INTO evt_mins (metric_id, at, value)
          SELECT metric_id, at / 60, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 60
+         ORDER BY at / 60, metric_id
          ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_mins.value + EXCLUDED.value;",
         None, &[]
     )?;
@@ -225,6 +227,7 @@ fn coordinator_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error>
     client.update(
         "INSERT INTO evt_hours (metric_id, at, value)
          SELECT metric_id, at / 3600, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 3600
+         ORDER BY at / 3600, metric_id
          ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_hours.value + EXCLUDED.value;",
         None, &[]
     )?;
@@ -233,6 +236,7 @@ fn coordinator_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error>
     client.update(
         "INSERT INTO evt_days (metric_id, at, value)
          SELECT metric_id, at / 86400, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 86400
+         ORDER BY at / 86400, metric_id
          ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_days.value + EXCLUDED.value;",
         None, &[]
     )?;
@@ -241,6 +245,7 @@ fn coordinator_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error>
     client.update(
         "INSERT INTO evt_30s (metric_id, at, value)
          SELECT metric_id, at / 2592000, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 2592000
+         ORDER BY at / 2592000, metric_id
          ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_30s.value + EXCLUDED.value;",
         None, &[]
     )?;
