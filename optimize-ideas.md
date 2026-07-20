@@ -51,14 +51,34 @@ This document outlines architectural, system-level, and software-level strategie
 
 ---
 
+## High-Cardinality Scaling Proposals
+
+### 7. Embedded LSM-Tree Ingestion (Fjall / RocksDB Crate)
+*   **Status**: **PROPOSED**
+*   **Core Concept**: Completely bypass B-Tree index write-amplification and page splits in the database.
+*   **Mechanism**: Add a pure-Rust embedded LSM engine (e.g., `fjall` crate) into the extension. The background worker writes incoming metrics directly to a local WAL/MemTable on disk. Expose the data to PostgreSQL queries via Rust Set-Returning Functions (UDFs).
+*   **Benefits**: Disk writes become sequential append-only operations, keeping write throughput high regardless of cardinality.
+
+### 8. Partitioning event tables by Time (`at`)
+*   **Status**: **PROPOSED**
+*   **Core Concept**: Slice database tables into chronological chunks (hourly/daily).
+*   **Mechanism**: Use native PostgreSQL declarative partitioning. Indices are created per-partition, meaning active index leaf nodes stay small and fit entirely inside the database `shared_buffers` cache.
+
+### 9. Index FillFactor Tuning
+*   **Status**: **PROPOSED**
+*   **Core Concept**: Reduce leaf page splitting frequency during high-cardinality merges.
+*   **Mechanism**: Alter primary key indexes to set `FILLFACTOR = 80`. This reserves 20% free space on each index page to absorb chronological inserts, delaying B-Tree page splits.
+
+---
+
 ## Proposed Optimizations
 
-### 7. Inline Assembly Parser (Aarch64 / x86_64 ASM)
+### 10. Inline Assembly Parser (Aarch64 / x86_64 ASM)
 *   **Status**: **PROPOSED**
 *   **Core Concept**: Bypass compiler intermediate representations and enforce optimal register layout.
 *   **Mechanism**: Write the decoding loop in raw assembly using conditional selects (`CSEL` on ARM, `CMOV` on x86) to run loop updates in CPU registers.
 
-### 8. Kernel Bypass (AF_XDP)
+### 11. Kernel Bypass (AF_XDP)
 *   **Status**: **PROPOSED**
 *   **Core Concept**: Avoid the Linux kernel network stack and socket layer entirely.
 *   **Mechanism**: Maps the network card (NIC) receive queue ring buffers directly into user space via zero-copy.
