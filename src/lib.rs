@@ -63,20 +63,6 @@ extension_sql!(
         rollup_type VARCHAR(20) PRIMARY KEY,
         last_aggregated_at BIGINT NOT NULL
     );
-    CREATE UNLOGGED TABLE IF NOT EXISTS evt_secs_ram (
-        metric_id INT NOT NULL,
-        at BIGINT NOT NULL,
-        value DOUBLE PRECISION NOT NULL,
-        PRIMARY KEY (at, metric_id)
-    );
-    CREATE OR REPLACE VIEW v_evt_secs AS
-    SELECT metric_id, at, SUM(value) AS value
-    FROM (
-        SELECT metric_id, at, value FROM evt_secs
-        UNION ALL
-        SELECT metric_id, at, value FROM evt_secs_ram
-    ) t
-    GROUP BY metric_id, at;
     "#,
     name = "create_evt_tables"
 );
@@ -250,12 +236,12 @@ fn staging_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
     )?;
     client.update("TRUNCATE stat_pg_staging;", None, &[])?;
 
-    // 2. Merge into evt_secs_ram from temp table
+    // 2. Merge into evt_secs from temp table
     client.update(
-        "INSERT INTO evt_secs_ram (metric_id, at, value)
+        "INSERT INTO evt_secs (metric_id, at, value)
          SELECT metric_id, at, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at
          ORDER BY at, metric_id
-         ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_secs_ram.value + EXCLUDED.value;",
+         ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_secs.value + EXCLUDED.value;",
         None, &[]
     )?;
 
@@ -272,41 +258,6 @@ fn staging_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
         duration_ms
     );
     client.update(&latency_query, None, &[])?;
-
-    Ok(())
-}
-
-fn persist_ram_to_disk(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
-    let has_data: bool = client.select(
-        "SELECT EXISTS (SELECT FROM evt_secs_ram LIMIT 1);",
-        None, &[]
-    )?.first().get_one()?.unwrap_or(false);
-
-    if !has_data {
-        return Ok(());
-    }
-
-    // 1. Snapshot raw data from RAM table to temporary staging table
-    client.update(
-        "CREATE TEMPORARY TABLE stat_pg_ram_temp ON COMMIT DROP AS
-         SELECT metric_id, at, value FROM evt_secs_ram;",
-        None, &[]
-    )?;
-    
-    // Truncate RAM table immediately to release memory and lock resources
-    client.update("TRUNCATE evt_secs_ram;", None, &[])?;
-
-    // 2. Insert/Upsert into persisted disk table (evt_secs)
-    client.update(
-        "INSERT INTO evt_secs (metric_id, at, value)
-         SELECT metric_id, at, value FROM stat_pg_ram_temp
-         ORDER BY at, metric_id
-         ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_secs.value + EXCLUDED.value;",
-        None, &[]
-    )?;
-
-    // 3. Clean up temporary table
-    client.update("DROP TABLE stat_pg_ram_temp;", None, &[])?;
 
     Ok(())
 }
@@ -331,7 +282,7 @@ fn rollup_minutes(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
         let query = format!(
             "INSERT INTO evt_mins (metric_id, at, value) \
              SELECT metric_id, at / 60, SUM(value) \
-             FROM v_evt_secs \
+             FROM evt_secs \
              WHERE at >= {} AND at < {} \
              GROUP BY metric_id, at / 60 \
              ORDER BY at / 60, metric_id \
@@ -995,6 +946,9 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                         return Ok(());
                     }
 
+                    // Enable asynchronous commits for this transaction to write at RAM speed
+                    client.update("SET LOCAL synchronous_commit = off;", None, &[])?;
+
                     // 1. Refresh bounds by querying database max ID
                     let db_max_id: i32 = client.select(
                         "SELECT COALESCE(MAX(id), 0) FROM stat_pg_metrics;",
@@ -1010,20 +964,6 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     let num_workers = WORKERS.get() as usize;
                     if worker_index == 0 {
                         staging_merge(client)?;
-
-                        let current_sec = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or(Duration::ZERO)
-                            .as_secs() as i64;
-                        let current_min = current_sec / 60;
-                        let last_persisted_min = get_rollup_val(client, "persist_disk")?;
-                        if current_min > last_persisted_min {
-                            persist_ram_to_disk(client)?;
-                            client.update(
-                                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('persist_disk', {}) ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_min),
-                                None, &[]
-                            )?;
-                        }
                     }
                     if worker_index == 1 % num_workers as i32 {
                         rollup_minutes(client)?;
@@ -1065,6 +1005,22 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
         BackgroundWorker::wait_latch(Some(Duration::from_millis(50)));
     }
 
+    // Final flush of remaining metrics in active buffer before exit
+    let final_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() as i64;
+    let _ = BackgroundWorker::transaction(|| {
+        Spi::connect_mut(|client| {
+            let _ = client.update("SET LOCAL synchronous_commit = off;", None, &[]);
+            let active = active_buffer.lock().unwrap();
+            let has_values = active.iter().any(|&v| v > 0.0);
+            if has_values {
+                if flush_slot(client, final_at, &*active).is_ok() {
+                    let _ = staging_merge(client);
+                }
+            }
+            Ok::<(), pgrx::spi::Error>(())
+        })
+    });
+
     running.store(false, Ordering::Relaxed);
     if let Some(g) = guard.take() {
         if let Ok(report) = g.report().build() {
@@ -1098,9 +1054,6 @@ fn stat_pg_udp_stats() -> TableIterator<'static, (name!(received, i64), name!(dr
 #[pg_extern]
 fn stat_pg_force_rollups() -> Result<(), pgrx::spi::Error> {
     Spi::connect_mut(|client| {
-        // 0. Persist any remaining data from RAM table to disk
-        persist_ram_to_disk(client)?;
-
         // 1. Truncate all rollup tables to prevent double-counting upon clean rebuild
         client.update("TRUNCATE evt_mins, evt_hours, evt_days, evt_30s, stat_pg_rollups;", None, &[])?;
 
@@ -1207,7 +1160,6 @@ mod tests {
             let data = vec![0.0, 4.5]; // index 1 is test_metric
             crate::flush_slot(client, 1000, &data).expect("Flush slot failed");
             crate::staging_merge(client).expect("Merge failed");
-            crate::persist_ram_to_disk(client).expect("Persist failed");
             crate::rollup_minutes(client).expect("Rollup minutes failed");
             crate::rollup_hours(client).expect("Rollup hours failed");
             crate::rollup_days(client).expect("Rollup days failed");
@@ -1228,7 +1180,6 @@ mod tests {
             let data2 = vec![0.0, 5.5];
             crate::flush_slot(client, 1000, &data2).expect("Flush slot failed");
             crate::staging_merge(client).expect("Merge failed");
-            crate::persist_ram_to_disk(client).expect("Persist failed");
             crate::rollup_minutes(client).expect("Rollup minutes failed");
             crate::rollup_hours(client).expect("Rollup hours failed");
             crate::rollup_days(client).expect("Rollup days failed");
