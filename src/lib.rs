@@ -216,7 +216,7 @@ fn get_rollup_val(c: &mut SpiClient<'_>, rtype: &str) -> Result<i64, pgrx::spi::
     }
 }
 
-fn coordinator_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
+fn staging_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
     let has_data: bool = client.select(
         "SELECT EXISTS (SELECT FROM stat_pg_staging LIMIT 1);",
         None, &[]
@@ -248,18 +248,29 @@ fn coordinator_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error>
     // 3. Clean up temporary table
     client.update("DROP TABLE stat_pg_temp;", None, &[])?;
 
-    // 4. Cascading Rollups logic
+    let duration_ms = start_time.elapsed().unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0;
+    let latency_query = format!(
+        "INSERT INTO stat_pg_processed (worker_id, count, total_latency_ms, merge_count) \
+         VALUES (0, 0, {}, 1) \
+         ON CONFLICT (worker_id) \
+         DO UPDATE SET total_latency_ms = stat_pg_processed.total_latency_ms + EXCLUDED.total_latency_ms, \
+                       merge_count = stat_pg_processed.merge_count + EXCLUDED.merge_count;",
+        duration_ms
+    );
+    client.update(&latency_query, None, &[])?;
+
+    Ok(())
+}
+
+fn rollup_minutes(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
     let current_sec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs() as i64;
 
     let last_min = get_rollup_val(client, "minute")?;
-    let last_hour = get_rollup_val(client, "hour")?;
-    let last_day = get_rollup_val(client, "day")?;
-    let last_30d = get_rollup_val(client, "30d")?;
-
     let current_min = current_sec / 60;
+
     if last_min == 0 {
         client.update(
             &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('minute', {}) ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_min),
@@ -284,95 +295,118 @@ fn coordinator_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error>
             None, &[]
         )?;
     }
+    Ok(())
+}
 
+fn rollup_hours(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
+    let current_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64;
+
+    let last_hour = get_rollup_val(client, "hour")?;
     let current_hour = current_sec / 3600;
+
     if last_hour == 0 {
         client.update(
             &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('hour', {}) ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_hour),
             None, &[]
         )?;
     } else if current_hour > last_hour {
-        let start_at = last_hour * 60;
-        let end_at = current_hour * 60;
-        let query = format!(
-            "INSERT INTO evt_hours (metric_id, at, value) \
-             SELECT metric_id, at / 60, SUM(value) \
-             FROM evt_mins \
-             WHERE at >= {} AND at < {} \
-             GROUP BY metric_id, at / 60 \
-             ORDER BY at / 60, metric_id \
-             ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_hours.value + EXCLUDED.value;",
-            start_at, end_at
-        );
-        client.update(&query, None, &[])?;
-        client.update(
-            &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'hour';", current_hour),
-            None, &[]
-        )?;
+        // Watermark Check: Minute rollup must have processed up to current_hour * 60
+        let minute_watermark = get_rollup_val(client, "minute")?;
+        if minute_watermark >= current_hour * 60 {
+            let start_at = last_hour * 60;
+            let end_at = current_hour * 60;
+            let query = format!(
+                "INSERT INTO evt_hours (metric_id, at, value) \
+                 SELECT metric_id, at / 60, SUM(value) \
+                 FROM evt_mins \
+                 WHERE at >= {} AND at < {} \
+                 GROUP BY metric_id, at / 60 \
+                 ORDER BY at / 60, metric_id \
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_hours.value + EXCLUDED.value;",
+                start_at, end_at
+            );
+            client.update(&query, None, &[])?;
+            client.update(
+                &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'hour';", current_hour),
+                None, &[]
+            )?;
+        }
     }
+    Ok(())
+}
 
+fn rollup_days(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
+    let current_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64;
+
+    let last_day = get_rollup_val(client, "day")?;
     let current_day = current_sec / 86400;
+
     if last_day == 0 {
         client.update(
             &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('day', {}) ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_day),
             None, &[]
         )?;
     } else if current_day > last_day {
-        let start_at = last_day * 24;
-        let end_at = current_day * 24;
-        let query = format!(
-            "INSERT INTO evt_days (metric_id, at, value) \
-             SELECT metric_id, at / 24, SUM(value) \
-             FROM evt_hours \
-             WHERE at >= {} AND at < {} \
-             GROUP BY metric_id, at / 24 \
-             ORDER BY at / 24, metric_id \
-             ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_days.value + EXCLUDED.value;",
-            start_at, end_at
-        );
-        client.update(&query, None, &[])?;
-        client.update(
-            &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'day';", current_day),
-            None, &[]
-        )?;
+        // Watermark Check: Hour rollup must have processed up to current_day * 24
+        let hour_watermark = get_rollup_val(client, "hour")?;
+        if hour_watermark >= current_day * 24 {
+            let start_at = last_day * 24;
+            let end_at = current_day * 24;
+            let query = format!(
+                "INSERT INTO evt_days (metric_id, at, value) \
+                 SELECT metric_id, at / 24, SUM(value) \
+                 FROM evt_hours \
+                 WHERE at >= {} AND at < {} \
+                 GROUP BY metric_id, at / 24 \
+                 ORDER BY at / 24, metric_id \
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_days.value + EXCLUDED.value;",
+                start_at, end_at
+            );
+            client.update(&query, None, &[])?;
+            client.update(
+                &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'day';", current_day),
+                None, &[]
+            )?;
+        }
     }
 
+    let last_30d = get_rollup_val(client, "30d")?;
     let current_30d = current_sec / 2592000;
+
     if last_30d == 0 {
         client.update(
             &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('30d', {}) ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_30d),
             None, &[]
         )?;
     } else if current_30d > last_30d {
-        let start_at = last_30d * 30;
-        let end_at = current_30d * 30;
-        let query = format!(
-            "INSERT INTO evt_30s (metric_id, at, value) \
-             SELECT metric_id, at / 30, SUM(value) \
-             FROM evt_days \
-             WHERE at >= {} AND at < {} \
-             GROUP BY metric_id, at / 30 \
-             ORDER BY at / 30, metric_id \
-             ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_30s.value + EXCLUDED.value;",
-            start_at, end_at
-        );
-        client.update(&query, None, &[])?;
-        client.update(
-            &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = '30d';", current_30d),
-            None, &[]
-        )?;
+        // Watermark Check: Day rollup must have processed up to current_30d * 30
+        let day_watermark = get_rollup_val(client, "day")?;
+        if day_watermark >= current_30d * 30 {
+            let start_at = last_30d * 30;
+            let end_at = current_30d * 30;
+            let query = format!(
+                "INSERT INTO evt_30s (metric_id, at, value) \
+                 SELECT metric_id, at / 30, SUM(value) \
+                 FROM evt_days \
+                 WHERE at >= {} AND at < {} \
+                 GROUP BY metric_id, at / 30 \
+                 ORDER BY at / 30, metric_id \
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_30s.value + EXCLUDED.value;",
+                start_at, end_at
+            );
+            client.update(&query, None, &[])?;
+            client.update(
+                &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = '30d';", current_30d),
+                None, &[]
+            )?;
+        }
     }
-
-    let duration_ms = start_time.elapsed().unwrap_or(Duration::ZERO).as_secs_f64() * 1000.0;
-    let latency_query = format!(
-        "INSERT INTO stat_pg_processed (worker_id, count, total_latency_ms, merge_count) \
-         VALUES (0, 0, {}, 1) \
-         ON CONFLICT (worker_id) \
-         DO UPDATE SET total_latency_ms = stat_pg_processed.total_latency_ms + EXCLUDED.total_latency_ms, \
-                       merge_count = stat_pg_processed.merge_count + EXCLUDED.merge_count;",
-        duration_ms
-    );
-    client.update(&latency_query, None, &[])?;
 
     Ok(())
 }
@@ -923,9 +957,19 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     // 2. Flush slot data
                     flush_slot(client, at, &local_flush_buffer)?;
 
-                    // 3. Coordinator worker merges staging table into rollup tables
+                    // 3. Perform parallel pipeline database tasks
+                    let num_workers = WORKERS.get() as usize;
                     if worker_index == 0 {
-                        coordinator_merge(client)?;
+                        staging_merge(client)?;
+                    }
+                    if worker_index == 1 % num_workers as i32 {
+                        rollup_minutes(client)?;
+                    }
+                    if worker_index == 2 % num_workers as i32 {
+                        rollup_hours(client)?;
+                    }
+                    if worker_index == 3 % num_workers as i32 {
+                        rollup_days(client)?;
                     }
 
                     // 4. Update the total metrics processed count
@@ -1096,7 +1140,10 @@ mod tests {
             // 2. Perform aggregate flush of a slot
             let data = vec![0.0, 4.5]; // index 1 is test_metric
             crate::flush_slot(client, 1000, &data).expect("Flush slot failed");
-            crate::coordinator_merge(client).expect("Merge failed");
+            crate::staging_merge(client).expect("Merge failed");
+            crate::rollup_minutes(client).expect("Rollup minutes failed");
+            crate::rollup_hours(client).expect("Rollup hours failed");
+            crate::rollup_days(client).expect("Rollup days failed");
 
             // Query check for seconds
             let val = client.select(
@@ -1113,7 +1160,10 @@ mod tests {
             // Upsert (conflict update) check
             let data2 = vec![0.0, 5.5];
             crate::flush_slot(client, 1000, &data2).expect("Flush slot failed");
-            crate::coordinator_merge(client).expect("Merge failed");
+            crate::staging_merge(client).expect("Merge failed");
+            crate::rollup_minutes(client).expect("Rollup minutes failed");
+            crate::rollup_hours(client).expect("Rollup hours failed");
+            crate::rollup_days(client).expect("Rollup days failed");
 
             // Query check again (value should be aggregated: 4.5 + 5.5 = 10.0)
             let val2 = client.select(

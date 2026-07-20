@@ -30,21 +30,28 @@ This document outlines architectural, system-level, and software-level strategie
     *   Ingestion throughput rose from **177.6M MPS to 2.88 Billion MPS** (a **16.2x raw speedup**).
     *   Network byte overhead reduced by **27.4%** per metric update (down to **2.49 bytes/update**).
 
+### 5. Concurrent Multi-Worker Background Rollups (Candidate 3)
+*   **Status**: **IMPLEMENTED**
+*   **Core Concept**: Parallelize the background rollup execution using multiple background workers to prevent index/lock contention.
+*   **Mechanism**: Partitioned database tasks across background workers:
+    *   Worker 0: performs staging merges (`staging_merge`) into `evt_secs`.
+    *   Worker 1: performs minute rollups (`rollup_minutes`) into `evt_mins`.
+    *   Worker 2: performs hour rollups (`rollup_hours`) into `evt_hours`.
+    *   Worker 3: performs day/30d rollups (`rollup_days`) into `evt_days` / `evt_30s`.
+    *   Watermark Synchronization: Workers check `stat_pg_rollups` metadata to ensure lower-tier tables are fully aggregated before performing the next rollup tier, preventing race conditions.
+*   **Results**: A completely lock-free parallel write pipeline, ensuring zero write-write conflicts across tables.
+
 ---
 
 ## Retired Proposals
 
-### 5. Memory Prefetching to Hide Cache Latency
+### 6. Memory Prefetching to Hide Cache Latency
 *   **Status**: **RETIRED**
 *   **Reason**: Attempting to prefetch memory addresses using assembly instructions (`prefetcht0` / `prfm`) inside the metric loop halved throughput (dropping ingestion speed to 83M MPS). In a loop performing back-to-back updates, prefetch instructions saturated execution load ports in the CPU's load/store pipeline, causing execution queues to stall.
 
 ---
 
 ## Proposed Optimizations
-
-### 6. Parallelized Multi-Worker Background Rollups (Candidate 3)
-*   **Status**: **PROPOSED**
-*   **Core Concept**: Parallelize the background rollup execution using multiple background workers to prevent index/lock contention.
 
 ### 7. Inline Assembly Parser (Aarch64 / x86_64 ASM)
 *   **Status**: **PROPOSED**
