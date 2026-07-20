@@ -72,7 +72,7 @@ static DB_NAME: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new
 static DB_USER: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static BIND_ADDR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static PORT: GucSetting<i32> = GucSetting::<i32>::new(8125);
-static FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new(1.0);
+static FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new(10.0);
 static BUFFER_WINDOW: GucSetting<i32> = GucSetting::<i32>::new(5);
 static WORKERS: GucSetting<i32> = GucSetting::<i32>::new(4);
 
