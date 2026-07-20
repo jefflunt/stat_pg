@@ -563,7 +563,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += 1.0; }
                         parsed_count += 1;
@@ -576,7 +576,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) -= 1.0; }
                         parsed_count += 1;
@@ -589,7 +589,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { *buf.as_ptr().add(offset + 2) as i8 } as f64;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
@@ -603,7 +603,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { *buf.as_ptr().add(offset + 2) } as f64;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
@@ -617,7 +617,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const i16) } as f64;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
@@ -631,7 +631,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const u16) } as f64;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
@@ -645,7 +645,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val_bits = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const u16) };
                     let val = f16_to_f64(val_bits);
                     if id > 0 && id <= max_id && id < active.len() {
@@ -660,7 +660,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const i32) } as f64;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
@@ -674,7 +674,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const u32) } as f64;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
@@ -688,7 +688,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const f32) } as f64;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
@@ -702,7 +702,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const i64) } as f64;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
@@ -716,7 +716,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const u64) } as f64;
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
@@ -730,7 +730,7 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 if offset + segment_len > n { break; }
                 
                 for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const i16) } as usize;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
                     let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const f64) };
                     if id > 0 && id <= max_id && id < active.len() {
                         unsafe { *active.get_unchecked_mut(id) += val; }
