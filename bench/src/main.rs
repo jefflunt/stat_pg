@@ -367,7 +367,7 @@ fn main() {
     // Automatically truncate and vacuum database tables before registering metrics
     println!("Database cleanup: Truncating event tables and vacuuming...");
     if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
-        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, evt_secs, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups RESTART IDENTITY CASCADE;", &[]);
+        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, evt_secs, evt_secs_ram, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups RESTART IDENTITY CASCADE;", &[]);
         let _ = client.execute("VACUUM ANALYZE;", &[]);
     }
 
