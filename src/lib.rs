@@ -176,7 +176,7 @@ fn flush_slot(client: &mut SpiClient<'_>, ts: i64, data: &[f64]) -> Result<(), p
     }
 
     let pid = std::process::id();
-    let filename = format!("/tmp/flush_{}.csv", pid);
+    let filename = format!("/dev/shm/flush_{}.csv", pid);
     
     use std::io::{BufWriter, Write};
     if let Ok(file) = std::fs::File::create(&filename) {
