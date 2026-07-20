@@ -310,12 +310,28 @@ fn main() {
     let metrics_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    let db_port = if host == "127.0.0.1" || host == "localhost" { 5433 } else { 5432 };
+    let db_url = format!("postgres://postgres:postgres@{}:{}/postgres", host, db_port);
+
     // Spawn background SQL monitoring thread
     let host_clone = host.clone();
+    let db_url_clone = db_url.clone();
+    let running_clone = Arc::clone(&running);
     let query_thread = thread::spawn(move || {
+        let mut flush_interval = 1.0f64;
+        if let Ok(mut client) = postgres::Client::connect(&db_url_clone, postgres::NoTls) {
+            if let Ok(row) = client.query_one("SHOW stat_pg.flush_interval;", &[]) {
+                let val: String = row.get(0);
+                let cleaned = val.trim().trim_end_matches('s');
+                flush_interval = cleaned.parse::<f64>().unwrap_or(1.0);
+            }
+        }
+        println!("Background monitor detected database flush interval: {:.1}s", flush_interval);
+
         let mut run = 1;
         let mut previous_processed = 0u64;
         let mut stable_seconds = 0;
+        let mut benchmark_finished_time: Option<Instant> = None;
 
         loop {
             thread::sleep(Duration::from_secs(15));
@@ -343,14 +359,24 @@ fn main() {
                 duration
             );
 
-            if current_processed == previous_processed && current_processed > 0 {
-                stable_seconds += 15;
-                if stable_seconds >= 15 {
-                    println!("\nDatabase inserts have stabilized. Ingestion queue is fully drained!");
-                    break;
+            let is_running = running_clone.load(Ordering::Relaxed);
+            if !is_running && benchmark_finished_time.is_none() {
+                benchmark_finished_time = Some(Instant::now());
+            }
+
+            if !is_running {
+                let elapsed_since_finish = benchmark_finished_time.unwrap().elapsed().as_secs_f64();
+                if elapsed_since_finish >= (flush_interval + 10.0) {
+                    if current_processed == previous_processed && current_processed > 0 {
+                        stable_seconds += 15;
+                        if stable_seconds >= 15 {
+                            println!("\nDatabase inserts have stabilized. Ingestion queue is fully drained!");
+                            break;
+                        }
+                    } else {
+                        stable_seconds = 0;
+                    }
                 }
-            } else {
-                stable_seconds = 0;
             }
 
             previous_processed = current_processed;
@@ -358,17 +384,14 @@ fn main() {
         }
     });
 
-    let db_port = if host == "127.0.0.1" || host == "localhost" { 5433 } else { 5432 };
-    let db_url = format!("postgres://postgres:postgres@{}:{}/postgres", host, db_port);
-
     let mut initial_udp_received = 0i64;
     let mut initial_udp_dropped = 0i64;
 
     // Automatically truncate and vacuum database tables before registering metrics
     println!("Database cleanup: Truncating event tables and vacuuming...");
     if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
-        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, evt_secs, evt_secs_ram, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups RESTART IDENTITY CASCADE;", &[]);
-        let _ = client.execute("VACUUM ANALYZE;", &[]);
+        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, evt_secs, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups RESTART IDENTITY CASCADE;", &[]);
+        let _ = client.execute("VACUUM ANALYZE stat_pg_metrics, evt_secs, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups;", &[]);
     }
 
     // Register all simulated metric names in the database and retrieve their IDs
