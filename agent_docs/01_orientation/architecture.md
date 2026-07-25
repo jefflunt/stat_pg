@@ -8,15 +8,22 @@
 
 ```mermaid
 graph TD
-    Client[Client / Benchmark Systems] -->|UDP Packets on port 8125| OS[OS Socket Layer]
+    Client[Client / Benchmark Systems] -->|UDP Packets on port 8125| NIC[Network Interface: eth0]
     
+    subgraph eBPF Kernel Network Bypass Layer
+        NIC -->|Direct Driver Intercept| XDP["eBPF XDP Driver (stat_pg_xdp.bpf.c)"]
+        XDP -->|Lock-free per-CPU Accumulation| Map["BPF_MAP_TYPE_PERCPU_ARRAY (metrics_map)"]
+    end
+
+    XDP -->|XDP_PASS| OS[OS Socket Layer]
+
     subgraph PostgreSQL Cluster Processes
         OS -->|Load Balance via SO_REUSEPORT| Worker0["Background Worker 0 (Coordinator)"]
         OS -->|Load Balance via SO_REUSEPORT| WorkerN["Background Worker N (Aggregator)"]
         
         subgraph Worker 0 (Coordinator)
-            Worker0 -->|spawn| UDP0[UDP Listener Thread]
-            UDP0 -->|recvmmsg batch| Socket0[UDP Socket]
+            Worker0 -->|spawn| UDP0[UDP Listener Thread Pool]
+            UDP0 -->|recvmmsg batch + SIMD parse| Socket0[UDP Socket]
             Socket0 -->|Parse & Update| MutexBuf0["active_buffer (Mutex<Vec<f64>>)"]
             
             Main0[Main SPI Thread] -->|1. Swap local buffer every 1.0s| MutexBuf0
@@ -28,8 +35,8 @@ graph TD
         end
 
         subgraph Worker N (Aggregator)
-            WorkerN -->|spawn| UDPN[UDP Listener Thread]
-            UDPN -->|recvmmsg batch| SocketN[UDP Socket]
+            WorkerN -->|spawn| UDPN[UDP Listener Thread Pool]
+            UDPN -->|recvmmsg batch + SIMD parse| SocketN[UDP Socket]
             SocketN -->|Parse & Update| MutexBufN["active_buffer (Mutex<Vec<f64>>)"]
             
             MainN[Main SPI Thread] -->|1. Swap local buffer every 1.0s| MutexBufN

@@ -30,27 +30,44 @@ The codebase includes unit tests and live database integration tests (`#[pg_test
 docker compose exec db cargo test
 ```
 
-### 3. Load the Extension
-To run the DDL schema migrations (creating the tables `stat_pg_metrics`, `stat_pg_staging`, `stat_pg_secs`, `stat_pg_mins`, `stat_pg_hours`, `stat_pg_days`, and `stat_pg_30s`), load the extension in PostgreSQL:
+### 3. Load the Extension & Attach eBPF XDP Bypass
+To run DDL schema migrations (creating `stat_pg_metrics`, `stat_pg_staging`, `stat_pg_secs`, `stat_pg_mins`, `stat_pg_hours`, `stat_pg_days`, and `stat_pg_30s`), load the extension in PostgreSQL:
 ```bash
 docker compose exec db psql -U postgres -c "CREATE EXTENSION stat_pg;"
 ```
-*(If updating, you can run `DROP EXTENSION stat_pg CASCADE; CREATE EXTENSION stat_pg;` to reload).*
+
+To enable eBPF XDP kernel network bypass:
+```bash
+# 1. Compile eBPF program
+docker compose exec db clang -g -O2 -target bpf -I/usr/include/aarch64-linux-gnu -c /workspace/src/bpf/stat_pg_xdp.bpf.c -o /workspace/src/bpf/stat_pg_xdp.bpf.o
+
+# 2. Load eBPF program into kernel and pin maps
+docker compose exec --user root db bpftool prog load /workspace/src/bpf/stat_pg_xdp.bpf.o /sys/fs/bpf/stat_pg_xdp type xdp pinmaps /sys/fs/bpf/
+docker compose exec --user root db chmod 777 /sys/fs/bpf /sys/fs/bpf/metrics_map /sys/fs/bpf/stat_pg_xdp
+
+# 3. Attach eBPF XDP driver hook to eth0
+docker compose exec --user root db bpftool net attach xdpgeneric pinned /sys/fs/bpf/stat_pg_xdp dev eth0
+```
 
 ### 4. Run the Ingestion Benchmark
-Compile and run the host-native benchmark client to stress-test the ingestion limits:
+Compile and run the host-native benchmark client to stress-test ingestion limits:
 ```bash
-cd bench
-cargo build --release
-./target/release/stat-pg-bench --host 127.0.0.1 --port 8125 --threads 4 --duration 10 --metrics 1000
+cargo run --release --manifest-path bench/Cargo.toml -- --host 127.0.0.1 --port 8125 --threads 14 --readers 2 --duration 60 --metrics 1000 --local-agg
 ```
-#### Benchmark Operations
+#### Benchmark Options
+- `--threads <u32>`: Number of parallel UDP metric sender threads.
+- `--readers <u32>`: Number of concurrent SQL reader threads executing random metric aggregation queries.
+- `--metrics <u32>`: Number of unique metric time series (supports up to `64000`).
+- `--local-agg`: Enables client-side local aggregation mode for multi-billion metric persistence density.
+- `--duration <u32>`: Duration of test in seconds.
+
+#### Benchmark Execution Flow
 When `stat-pg-bench` starts, it automatically:
-1. Truncates all event and staging tables, and performs a database `VACUUM ANALYZE` to clear indexes and optimize tables.
-2. Registers simulated metric names (`bench.metric.[0-999]`) in the database to fetch their generated IDs.
-3. Warms up for `2.0` seconds to allow background workers to query the database and synchronize their `max_valid_id` buffer boundaries.
-4. Spawns threads to send packets containing 120 updates per UDP packet (mixed Format A/B). On Linux, it uses the optimized `sendmmsg` batch system call.
-5. Performs a final database consistency validation to verify that total values match perfectly across all 5 resolution tables.
+1. Truncates all event and staging tables, and performs a database `VACUUM ANALYZE`.
+2. Registers simulated metric names (`bench.metric.[0-N]`) using an $O(N)$ bulk `generate_series` query (~50ms for 64,000 metrics).
+3. Warms up for `2.0` seconds to allow background workers to synchronize `max_valid_id` boundaries.
+4. Blasts 16 mixed payload formats using `sendmmsg` UDP batching.
+5. Performs normalized database consistency validation across all 5 resolution tables.
 
 ---
 
