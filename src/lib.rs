@@ -997,8 +997,7 @@ fn read_ebpf_map_metrics(flush_buf: &mut [f64]) {
         return;
     }
 
-    let num_cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize;
-    let mut percpu_vals = vec![0u64; num_cpus];
+    let mut percpu_vals = vec![0u64; 256];
     let mut total_ebpf_count = 0u64;
 
     for key in 1..flush_buf.len() {
@@ -1024,10 +1023,10 @@ fn read_ebpf_map_metrics(flush_buf: &mut [f64]) {
         };
 
         if res == 0 {
-            let sum: u64 = percpu_vals.iter().sum();
+            let sum: u64 = percpu_vals.iter().cloned().fold(0u64, |a, b| a.saturating_add(b));
             if sum > 0 {
                 flush_buf[key] += sum as f64;
-                total_ebpf_count += sum;
+                total_ebpf_count = total_ebpf_count.saturating_add(sum);
 
                 percpu_vals.fill(0);
                 let mut attr_update = [0u8; 32];
@@ -1242,8 +1241,10 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                 std::mem::swap(&mut *active, &mut local_flush_buffer);
             }
 
-            // If eBPF XDP is active, aggregate BPF map values directly into local_flush_buffer
-            read_ebpf_map_metrics(&mut local_flush_buffer);
+            // If eBPF XDP is active, aggregate BPF map values directly into local_flush_buffer (Worker 0 only)
+            if worker_index == 0 {
+                read_ebpf_map_metrics(&mut local_flush_buffer);
+            }
 
             let at = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() as i64;
 

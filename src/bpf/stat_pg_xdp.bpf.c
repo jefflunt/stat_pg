@@ -43,21 +43,56 @@ int stat_pg_xdp_prog(struct xdp_md *ctx) {
     if ((void *)(payload + 4) > data_end)
         return XDP_PASS;
 
+    unsigned char format = payload[1];
     unsigned char *curr = payload + 4;
 
-    #pragma clang loop unroll(disable)
-    for (int i = 0; i < 32; i++) {
-        if ((void *)(curr + 4) > data_end)
-            break;
+    if (format == 0) { // INC format (2 bytes per update: u16 id, implicit +1)
+        #pragma clang loop unroll(disable)
+        for (int i = 0; i < 64; i++) {
+            if ((void *)(curr + 2) > data_end)
+                break;
 
-        __u32 id = curr[0] | ((__u32)curr[1] << 8);
-        __u16 val = curr[2] | ((__u16)curr[3] << 8);
-        curr += 4;
+            __u32 id = curr[0] | ((__u32)curr[1] << 8);
+            curr += 2;
 
-        if (id > 0 && id < 65536) {
-            __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
-            if (v) {
-                *v += val;
+            if (id > 0 && id < 65536) {
+                __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
+                if (v) {
+                    *v += 1;
+                }
+            }
+        }
+    } else if (format == 1) { // DEC format (2 bytes per update: u16 id, implicit -1)
+        #pragma clang loop unroll(disable)
+        for (int i = 0; i < 64; i++) {
+            if ((void *)(curr + 2) > data_end)
+                break;
+
+            __u32 id = curr[0] | ((__u32)curr[1] << 8);
+            curr += 2;
+
+            if (id > 0 && id < 65536) {
+                __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
+                if (v && *v > 0) {
+                    *v -= 1;
+                }
+            }
+        }
+    } else if (format == 4 || format == 5) { // INT/UINT16 value (4 bytes per update: u16 id, u16 val)
+        #pragma clang loop unroll(disable)
+        for (int i = 0; i < 64; i++) {
+            if ((void *)(curr + 4) > data_end)
+                break;
+
+            __u32 id = curr[0] | ((__u32)curr[1] << 8);
+            __u16 val = curr[2] | ((__u16)curr[3] << 8);
+            curr += 4;
+
+            if (id > 0 && id < 65536) {
+                __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
+                if (v) {
+                    *v += val;
+                }
             }
         }
     }

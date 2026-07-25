@@ -330,7 +330,7 @@ fn main() {
 
         let mut run = 1;
         let mut previous_processed = 0u64;
-        let mut stable_seconds = 0;
+        let mut zero_processed_runs_after_finish = 0u32;
         let mut benchmark_finished_time: Option<Instant> = None;
 
         loop {
@@ -358,6 +358,7 @@ fn main() {
                 format_number(current_processed),
                 duration
             );
+            run += 1;
 
             let is_running = running_clone.load(Ordering::Relaxed);
             if !is_running && benchmark_finished_time.is_none() {
@@ -365,22 +366,25 @@ fn main() {
             }
 
             if !is_running {
+                if current_processed == 0 {
+                    zero_processed_runs_after_finish += 1;
+                    if zero_processed_runs_after_finish >= 3 {
+                        println!("\nNo metric updates detected in database after 3 monitor checks. Exiting monitor loop.");
+                        break;
+                    }
+                } else {
+                    zero_processed_runs_after_finish = 0;
+                }
+
                 let elapsed_since_finish = benchmark_finished_time.unwrap().elapsed().as_secs_f64();
                 if elapsed_since_finish >= (flush_interval + 10.0) {
                     if current_processed == previous_processed && current_processed > 0 {
-                        stable_seconds += 15;
-                        if stable_seconds >= 15 {
-                            println!("\nDatabase inserts have stabilized. Ingestion queue is fully drained!");
-                            break;
-                        }
-                    } else {
-                        stable_seconds = 0;
+                        println!("\nDatabase inserts have stabilized. Ingestion queue is fully drained!");
+                        break;
                     }
                 }
             }
-
             previous_processed = current_processed;
-            run += 1;
         }
     });
 
