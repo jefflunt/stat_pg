@@ -135,37 +135,24 @@ fn register_metrics(
 
     let mut name_to_id = HashMap::new();
 
-    let mut transaction = client.transaction()
-        .map_err(|e| format!("Failed to start transaction: {}", e))?;
-    
-    transaction.execute("LOCK TABLE stat_pg_metrics IN EXCLUSIVE MODE;", &[])
-        .map_err(|e| format!("Failed to lock table: {}", e))?;
+    let count_i32 = unique_metrics as i32;
+    client.execute(
+        "INSERT INTO stat_pg_metrics (name)
+         SELECT 'bench.metric.' || g
+         FROM generate_series(0, $1 - 1) g
+         ON CONFLICT (name) DO NOTHING;",
+        &[&count_i32]
+    ).map_err(|e| format!("Failed bulk metric registration: {}", e))?;
 
-    let prepared = transaction.prepare(
-        "INSERT INTO stat_pg_metrics (id, name)
-         VALUES (
-             (SELECT COALESCE(MIN(unused.id), 1)
-              FROM (
-                  SELECT 1 AS id
-                  UNION ALL
-                  SELECT id + 1 FROM stat_pg_metrics
-              ) unused
-              WHERE unused.id NOT IN (SELECT id FROM stat_pg_metrics)),
-             $1
-         )
-         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-         RETURNING id;"
-    ).map_err(|e| format!("Failed to prepare query: {}", e))?;
+    let rows = client.query("SELECT id, name FROM stat_pg_metrics;", &[])
+        .map_err(|e| format!("Failed querying registered metrics: {}", e))?;
 
-    for idx in 0..unique_metrics {
-        let name = format!("bench.metric.{}", idx);
-        let row = transaction.query_one(&prepared, &[&name])
-            .map_err(|e| format!("Failed to register {}: {}", name, e))?;
+    for row in rows {
         let id: i32 = row.get(0);
+        let name: String = row.get(1);
         name_to_id.insert(name, id);
     }
 
-    transaction.commit().map_err(|e| format!("Failed to commit: {}", e))?;
     Ok(name_to_id)
 }
 
