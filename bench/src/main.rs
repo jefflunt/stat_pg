@@ -117,6 +117,7 @@ fn print_help() {
            --host <str>      Target host IP (default: 127.0.0.1)\n  \
            --port <u16>      Target port (default: 8125)\n  \
            --threads <u32>   Sender threads (default: CPU cores)\n  \
+           --readers <u32>   Concurrent SQL reader threads (default: 0)\n  \
            --duration <u32>  Duration in seconds to run benchmark (default: 180)\n  \
            --metrics <u32>   Number of unique metrics to simulate (default: 1000)\n  \
            --local-agg       Simulate client-side local aggregation before sending\n  \
@@ -254,6 +255,7 @@ fn main() {
     let mut host = "127.0.0.1".to_string();
     let mut port = 8125u16;
     let mut threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut readers = 0u32;
     let mut duration_secs = 180u32;
     let mut unique_metrics = 1000u32;
     let mut local_agg = false;
@@ -272,6 +274,10 @@ fn main() {
             }
             "--threads" if i + 1 < args.len() => {
                 threads = args[i + 1].parse().expect("Invalid threads number");
+                i += 2;
+            }
+            "--readers" if i + 1 < args.len() => {
+                readers = args[i + 1].parse().expect("Invalid readers count");
                 i += 2;
             }
             "--duration" if i + 1 < args.len() => {
@@ -298,6 +304,9 @@ fn main() {
     println!("stat-pg-bench Starting UDP Stress Test");
     println!("Target Address : {}", target_addr);
     println!("Sender Threads : {}", threads);
+    if readers > 0 {
+        println!("Reader Threads : {}", readers);
+    }
     println!("Run Duration   : {} seconds ({:.1} minutes)", duration_secs, duration_secs as f64 / 60.0);
     println!("Unique Metrics : {}", unique_metrics);
     println!("Protocol Format: Raw UDP (16 formats, ~366 updates/packet)");
@@ -435,6 +444,35 @@ fn main() {
     let start_time = Instant::now();
     let mut worker_handles = Vec::with_capacity(threads as usize);
 
+    let read_queries_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let read_queries_latency_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut reader_handles = Vec::with_capacity(readers as usize);
+
+    for reader_id in 0..readers {
+        let running_clone = running.clone();
+        let read_queries_clone = read_queries_count.clone();
+        let read_latency_clone = read_queries_latency_us.clone();
+        let db_url_clone = db_url.clone();
+        let unique_metrics = unique_metrics;
+
+        let handle = thread::spawn(move || {
+            if let Ok(mut client) = postgres::Client::connect(&db_url_clone, postgres::NoTls) {
+                let mut rng = SimpleRng::new(reader_id as u64 + 9999);
+
+                while running_clone.load(Ordering::Relaxed) {
+                    let metric_id = (rng.next_u64() % unique_metrics as u64) as i32 + 1;
+                    let query_start = Instant::now();
+                    let _ = client.query("SELECT metric_id, SUM(value) FROM stat_pg_secs WHERE metric_id = $1 GROUP BY metric_id;", &[&metric_id]);
+                    let latency_us = query_start.elapsed().as_micros() as u64;
+
+                    read_queries_clone.fetch_add(1, Ordering::Relaxed);
+                    read_latency_clone.fetch_add(latency_us, Ordering::Relaxed);
+                }
+            }
+        });
+        reader_handles.push(handle);
+    }
+
     // Spawn sender threads
     for thread_id in 0..threads {
         let running_clone = running.clone();
@@ -476,86 +514,38 @@ fn main() {
                 return;
             }
 
+            let mut rng = SimpleRng::new(12345 + thread_id as u64);
             let mut local_packets = 0u64;
             let mut local_metrics = 0u64;
             let mut local_bytes = 0u64;
 
-            let mut rng = SimpleRng::new(12345 + thread_id as u64);
-
             if local_agg {
                 // Local Aggregation Mode:
-                // Accumulate updates in memory and flush periodically (every 5,000 generated events).
-                let batch_size = 5000;
                 let mut local_values = vec![0.0f64; unique_metrics as usize];
-                let mut local_formats = vec![0u8; unique_metrics as usize];
-                let mut touched = Vec::with_capacity(unique_metrics as usize);
                 let mut touched_set = vec![false; unique_metrics as usize];
+                let mut touched = Vec::with_capacity(unique_metrics as usize);
 
+                let batch_size = 5000;
                 let mut local_generated = 0u64;
 
                 while running_clone.load(Ordering::Relaxed) {
                     for _ in 0..batch_size {
                         let metric_idx = (rng.next_u64() % unique_metrics as u64) as usize;
                         let rand_val = rng.next_f64();
-                        
                         let val: f64;
-                        let format: u8;
                         if rand_val < 0.60 {
-                            if rng.next_u64() % 2 == 0 {
-                                val = 1.0;
-                                format = 0;
-                            } else {
-                                val = -1.0;
-                                format = 1;
-                            }
+                            val = if rng.next_u64() % 2 == 0 { 1.0 } else { -1.0 };
                         } else if rand_val < 0.75 {
-                            let val_u8 = (rng.next_u64() % 256) as u8;
-                            val = val_u8 as f64;
-                            format = 3;
+                            val = (rng.next_u64() % 256) as f64;
                         } else if rand_val < 0.90 {
-                            let format_choice = rng.next_u64() % 4;
-                            format = match format_choice {
-                                0 => 4,
-                                1 => 5,
-                                2 => 6,
-                                _ => 7,
-                            };
-                            if format == 6 || format == 7 {
-                                val = 15.5;
-                            } else {
-                                val = (rng.next_u64() % 65536) as f64;
-                            }
+                            val = (rng.next_u64() % 65536) as f64;
                         } else if rand_val < 0.98 {
-                            let format_choice = rng.next_u64() % 4;
-                            format = match format_choice {
-                                0 => 8,
-                                1 => 9,
-                                2 => 10,
-                                _ => 11,
-                            };
-                            if format == 10 || format == 11 {
-                                val = 123.456;
-                            } else {
-                                val = (rng.next_u64() % 1000000) as f64;
-                            }
+                            val = (rng.next_u64() % 4294967296) as f64;
                         } else {
-                            let format_choice = rng.next_u64() % 4;
-                            format = match format_choice {
-                                0 => 12,
-                                1 => 13,
-                                2 => 14,
-                                _ => 15,
-                            };
-                            if format == 14 || format == 15 {
-                                val = 12345.6789;
-                            } else {
-                                val = (rng.next_u64() % 10000000) as f64;
-                            }
+                            val = (rng.next_u64() % 10000000) as f64;
                         }
 
                         local_values[metric_idx] += val;
-                        local_formats[metric_idx] = format;
-
                         if !touched_set[metric_idx] {
                             touched_set[metric_idx] = true;
                             touched.push(metric_idx);
@@ -809,6 +799,9 @@ fn main() {
                         }; batch_size];
 
                         let mut packet_idx = 0;
+                        let mut local_packets = 0u64;
+                        let mut local_metrics = 0u64;
+                        let mut local_bytes = 0u64;
 
                         while running_clone.load(Ordering::Relaxed) {
                             for i in 0..batch_size {
@@ -816,8 +809,7 @@ fn main() {
                                 let (packet_bytes, _) = &prebuilt_packets[p_idx];
                                 iovecs[i].iov_base = packet_bytes.as_ptr() as *mut libc::c_void;
                                 iovecs[i].iov_len = packet_bytes.len();
-
-                                mmsgs[i].msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+                                mmsgs[i].msg_hdr.msg_iov = &mut iovecs[i];
                                 mmsgs[i].msg_hdr.msg_iovlen = 1;
                             }
 
@@ -825,7 +817,7 @@ fn main() {
                                 libc::sendmmsg(
                                     fd,
                                     mmsgs.as_mut_ptr(),
-                                    batch_size as libc::c_uint,
+                                    batch_size as u32,
                                     0,
                                 )
                             };
@@ -860,6 +852,9 @@ fn main() {
                     }
                 } else {
                     let mut packet_idx = 0;
+                    let mut local_packets = 0u64;
+                    let mut local_metrics = 0u64;
+                    let mut local_bytes = 0u64;
                     while running_clone.load(Ordering::Relaxed) {
                         let (packet_bytes, updates) = &prebuilt_packets[packet_idx];
 
@@ -909,6 +904,9 @@ fn main() {
     for handle in worker_handles {
         let _ = handle.join();
     }
+    for handle in reader_handles {
+        let _ = handle.join();
+    }
 
     let elapsed = start_time.elapsed();
     let total_packets = packets_sent.load(Ordering::SeqCst);
@@ -936,6 +934,19 @@ fn main() {
     println!("Average PPS                    : {} Batches/sec (~366 updates/batch)", format_float(pps));
     println!("Average MPS                    : {} Metrics/sec (Sent)", format_number(mps));
     println!("Throughput                     : {:.2} MB/sec", mb_sec);
+    if readers > 0 {
+        let total_reads = read_queries_count.load(Ordering::SeqCst);
+        let total_read_us = read_queries_latency_us.load(Ordering::SeqCst);
+        let avg_read_latency_ms = if total_reads > 0 { (total_read_us as f64 / total_reads as f64) / 1000.0 } else { 0.0 };
+        let qps = if elapsed.as_secs_f64() > 0.0 { total_reads as f64 / elapsed.as_secs_f64() } else { 0.0 };
+
+        println!("--------------------------------------------------");
+        println!("Concurrent SQL Reader Performance:");
+        println!("  - Reader Threads               : {}", readers);
+        println!("  - Total Read Queries Executed  : {}", format_number(total_reads));
+        println!("  - Average Read Query Latency   : {:.2} ms", avg_read_latency_ms);
+        println!("  - Read Query Throughput        : {} Queries/sec", format_float(qps));
+    }
     println!("==================================================");
 
     // Wait for the SQL background monitoring thread to complete its remaining runs
