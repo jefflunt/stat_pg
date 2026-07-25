@@ -75,6 +75,7 @@ static PORT: GucSetting<i32> = GucSetting::<i32>::new(8125);
 static FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new(10.0);
 static BUFFER_WINDOW: GucSetting<i32> = GucSetting::<i32>::new(5);
 static WORKERS: GucSetting<i32> = GucSetting::<i32>::new(4);
+static THREADS_PER_WORKER: GucSetting<i32> = GucSetting::<i32>::new(4);
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -145,6 +146,17 @@ pub extern "C-unwind" fn _PG_init() {
         &WORKERS,
         1,
         16,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"stat_pg.threads_per_worker",
+        c"Number of receiver threads per worker process",
+        c"The number of parallel UDP listener threads spawned within each background worker process.",
+        &THREADS_PER_WORKER,
+        1,
+        32,
         GucContext::Sighup,
         GucFlags::default(),
     );
@@ -1020,103 +1032,107 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
     let running = Arc::new(AtomicBool::new(true));
     let metrics_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // Spawn UDP listener thread
-    let running_thread = running.clone();
-    let active_buffer_clone = active_buffer.clone();
-    let max_valid_id_clone = max_valid_id.clone();
-    let metrics_received_clone = metrics_received.clone();
+    // Spawn UDP listener thread pool per worker process
+    let num_receiver_threads = THREADS_PER_WORKER.get().max(1) as usize;
+    for t_idx in 0..num_receiver_threads {
+        let running_thread = running.clone();
+        let active_buffer_clone = active_buffer.clone();
+        let max_valid_id_clone = max_valid_id.clone();
+        let metrics_received_clone = metrics_received.clone();
+        let bind_addr = bind_addr.clone();
 
-    thread::spawn(move || {
-        let socket_addr = format!("{}:{}", bind_addr, port);
-        let addr: std::net::SocketAddr = match socket_addr.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("stat-pg: failed to parse socket address {}: {}", socket_addr, e);
-                return;
-            }
-        };
-
-        let socket = match socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("stat-pg: failed to create socket: {}", e);
-                return;
-            }
-        };
-
-        let _ = socket.set_reuse_address(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let optval: libc::c_int = 1;
-            let _ = unsafe {
-                libc::setsockopt(
-                    socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_REUSEPORT,
-                    &optval as *const libc::c_int as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            };
-        }
-        if let Err(e) = socket.set_recv_buffer_size(256 * 1024 * 1024) {
-            eprintln!("stat-pg: failed to set UDP receive buffer size (using OS max): {}", e);
-        }
-
-        let socket = match socket.bind(&addr.into()) {
-            Ok(_) => {
-                let std_sock: std::net::UdpSocket = socket.into();
-                eprintln!("stat-pg: bound UDP listener to {}", socket_addr);
-                std_sock
-            }
-            Err(e) => {
-                eprintln!("stat-pg: failed to bind UDP listener to {}: {}", socket_addr, e);
-                return;
-            }
-        };
-
-        if let Err(e) = socket.set_read_timeout(Some(Duration::from_millis(100))) {
-            eprintln!("stat-pg: failed to set UDP read timeout: {}", e);
-            return;
-        }
-
-        let mut bufs = vec![[0u8; 2048]; 128];
-        let mut lengths = vec![0; 128];
-
-        while running_thread.load(Ordering::Relaxed) {
-            match recv_batch_blocking(&socket, &mut bufs, &mut lengths) {
-                Ok(count) if count > 0 => {
-                    let mut active = active_buffer_clone.lock().unwrap();
-                    let max_id = max_valid_id_clone.load(Ordering::Relaxed) as usize;
-                    let mut local_count = 0;
-
-                    // Process the first batch
-                    for i in 0..count {
-                        local_count += parse_packet_payload(&bufs[i][..lengths[i]], max_id, &mut *active);
-                    }
-
-                    // Drain loop: fetch any other packets in the queue using non-blocking calls
-                    loop {
-                        match recv_batch_nonblocking(&socket, &mut bufs, &mut lengths) {
-                            Ok(drain_count) if drain_count > 0 => {
-                                for i in 0..drain_count {
-                                    local_count += parse_packet_payload(&bufs[i][..lengths[i]], max_id, &mut *active);
-                                }
-                            }
-                            _ => break,
-                        }
-                    }
-
-                    metrics_received_clone.fetch_add(local_count as u64, Ordering::Relaxed);
+        thread::spawn(move || {
+            let socket_addr = format!("{}:{}", bind_addr, port);
+            let addr: std::net::SocketAddr = match socket_addr.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("stat-pg: failed to parse socket address {}: {}", socket_addr, e);
+                    return;
                 }
-                _ => {} // Timeout or error, loop again to check running state
+            };
+
+            let socket = match socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("stat-pg: failed to create socket: {}", e);
+                    return;
+                }
+            };
+
+            let _ = socket.set_reuse_address(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let optval: libc::c_int = 1;
+                let _ = unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_REUSEPORT,
+                        &optval as *const libc::c_int as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    )
+                };
             }
-        }
-    });
+            if let Err(e) = socket.set_recv_buffer_size(256 * 1024 * 1024) {
+                eprintln!("stat-pg: failed to set UDP receive buffer size (using OS max): {}", e);
+            }
+
+            let socket = match socket.bind(&addr.into()) {
+                Ok(_) => {
+                    let std_sock: std::net::UdpSocket = socket.into();
+                    eprintln!("stat-pg: worker {} thread {} bound UDP listener to {}", worker_index, t_idx, socket_addr);
+                    std_sock
+                }
+                Err(e) => {
+                    eprintln!("stat-pg: failed to bind UDP listener to {}: {}", socket_addr, e);
+                    return;
+                }
+            };
+
+            if let Err(e) = socket.set_read_timeout(Some(Duration::from_millis(100))) {
+                eprintln!("stat-pg: failed to set UDP read timeout: {}", e);
+                return;
+            }
+
+            let mut bufs = vec![[0u8; 2048]; 128];
+            let mut lengths = vec![0; 128];
+
+            while running_thread.load(Ordering::Relaxed) {
+                match recv_batch_blocking(&socket, &mut bufs, &mut lengths) {
+                    Ok(count) if count > 0 => {
+                        let mut active = active_buffer_clone.lock().unwrap();
+                        let max_id = max_valid_id_clone.load(Ordering::Relaxed) as usize;
+                        let mut local_count = 0;
+
+                        // Process the first batch
+                        for i in 0..count {
+                            local_count += parse_packet_payload(&bufs[i][..lengths[i]], max_id, &mut *active);
+                        }
+
+                        // Drain loop: fetch any other packets in the queue using non-blocking calls
+                        loop {
+                            match recv_batch_nonblocking(&socket, &mut bufs, &mut lengths) {
+                                Ok(drain_count) if drain_count > 0 => {
+                                    for i in 0..drain_count {
+                                        local_count += parse_packet_payload(&bufs[i][..lengths[i]], max_id, &mut *active);
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+
+                        metrics_received_clone.fetch_add(local_count as u64, Ordering::Relaxed);
+                    }
+                    _ => {} // Timeout or error, loop again to check running state
+                }
+            }
+        });
+    }
 
     let mut last_flush = SystemTime::now();
     let mut local_flush_buffer = vec![0.0; max_id as usize + 1];

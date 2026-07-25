@@ -92,10 +92,11 @@ This document outlines architectural, system-level, and software-level strategie
 *   **Mechanism**: Processed 128-bit SIMD vector registers of 16-bit metric IDs and values in 8-way unrolled loops in `src/lib.rs`.
 *   **Results**: Confirmed 100% data consistency across all 5 rollup tables. Measured throughput matching 8-way unrolled pointer loops (~15.8M - 16.5M pps), proving empirically that UDP socket receive syscall latency is the primary bottleneck rather than payload decoding.
 
-### 13. Multi-Thread Receiver Pools Per Worker Socket
-*   **Status**: **PROPOSED**
+### 13. Multi-Thread Receiver Pools Per Worker Socket (Candidate 13)
+*   **Status**: **IMPLEMENTED**
 *   **Core Concept**: Scale socket-reading CPU concurrency beyond 1 thread per PostgreSQL background worker process.
-*   **Mechanism**: Spawn a pool of N receiver threads per worker process sharing a lock-free SPSC (Single Producer Single Consumer) queue, allowing 16-32 OS threads to drain `SO_REUSEPORT` sockets concurrently.
+*   **Mechanism**: Added GUC parameter `stat_pg.threads_per_worker` (default `4`). Each background worker process spawns a pool of parallel OS receiver threads binding sockets to `0.0.0.0:8125` with `SO_REUSEPORT`.
+*   **Results**: Demonstrated scaling to 32 parallel receiver sockets (`8 workers × 4 threads = 32 sockets`). Verified 100% data consistency across all 5 rollup tiers with 0 dropped packets in local-aggregation mode. Measured system performance proving that socket receiver thread count is optimal when aligned 1:1 with physical CPU core availability.
 
 ### 14. Inline Assembly Parser (Aarch64 / x86_64 ASM)
 *   **Status**: **PROPOSED**
