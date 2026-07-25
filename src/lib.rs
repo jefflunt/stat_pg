@@ -75,7 +75,7 @@ static PORT: GucSetting<i32> = GucSetting::<i32>::new(8125);
 static FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new(10.0);
 static BUFFER_WINDOW: GucSetting<i32> = GucSetting::<i32>::new(5);
 static WORKERS: GucSetting<i32> = GucSetting::<i32>::new(4);
-static THREADS_PER_WORKER: GucSetting<i32> = GucSetting::<i32>::new(4);
+static THREADS_PER_WORKER: GucSetting<i32> = GucSetting::<i32>::new(1);
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
