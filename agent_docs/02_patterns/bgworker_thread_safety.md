@@ -42,7 +42,7 @@ All spawned threads (the UDP listener socket receiver and parser threads) must r
   - The UDP thread reads an atomic `max_valid_id: Arc<AtomicI32>` value.
   - It only applies updates if `id > 0 && id <= max_valid_id && id < active_buffer.len()`.
   - The main thread updates `max_valid_id` during its periodic SPI flush sequence after querying the database to find the new maximum ID in `stat_pg_metrics`.
-  - If the database maximum ID increases, the main thread resizes both the active and local buffers before storing the new value in `max_valid_id`.
+  - When the database maximum ID increases, the main thread locks and resizes `active_buffer` immediately upon storing the new value in `max_valid_id`, ensuring UDP receiver threads can parse incoming packets with newly registered metric IDs without dropping them.
 
 ### 4. SPI Connection Boundaries
 The main thread alone manages connections to PostgreSQL database internals:

@@ -10,11 +10,11 @@ The aggregator computes and stores statistics at five distinct time resolutions:
 
 | Table | Resolution | Key Formula (`at`) |
 | :--- | :--- | :--- |
-| `evt_secs` | Second | `at` (Epoch timestamp) |
-| `evt_mins` | Minute | `at / 60` |
-| `evt_hours` | Hour | `at / 3600` |
-| `evt_days` | Day | `at / 86400` |
-| `evt_30s` | 30-Day | `at / 2592000` |
+| `stat_pg_secs` | Second | `at` (Epoch timestamp) |
+| `stat_pg_mins` | Minute | `at / 60` |
+| `stat_pg_hours` | Hour | `at / 3600` |
+| `stat_pg_days` | Day | `at / 86400` |
+| `stat_pg_30s` | 30-Day | `at / 2592000` |
 
 ---
 
@@ -41,17 +41,17 @@ CREATE UNLOGGED TABLE stat_pg_staging (
 );
 ```
 
-### 3. Metric Resolution Tables (`evt_secs`, `evt_mins`, `evt_hours`, `evt_days`, `evt_30s`)
+### 3. Metric Resolution Tables (`stat_pg_secs`, `stat_pg_mins`, `stat_pg_hours`, `stat_pg_days`, `stat_pg_30s`)
 Stores aggregated value data at various time granularities.
 ```sql
-CREATE TABLE evt_secs (
+CREATE TABLE stat_pg_secs (
     metric_id INT NOT NULL,
     at BIGINT NOT NULL,
-    value DECIMAL(20, 12) NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (at, metric_id)
 );
 ```
-*(All other resolution tables `evt_mins`, `evt_hours`, `evt_days`, and `evt_30s` use the exact same schema structure).*
+*(All other resolution tables `stat_pg_mins`, `stat_pg_hours`, `stat_pg_days`, and `stat_pg_30s` use the exact same schema structure).*
 
 ---
 

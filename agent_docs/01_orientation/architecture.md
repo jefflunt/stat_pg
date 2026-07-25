@@ -24,7 +24,7 @@ graph TD
             CSV0 -->|3. SQL COPY| Staging[(stat_pg_staging unlogged table)]
             
             Main0 -->|4. coordinator_merge| Staging
-            Staging -->|Aggregate & ORDER BY at, metric_id| EvtTables[(evt_secs, evt_mins, evt_hours, etc.)]
+            Staging -->|Aggregate & ORDER BY at, metric_id| EvtTables[(stat_pg_secs, stat_pg_mins, stat_pg_hours, etc.)]
         end
 
         subgraph Worker N (Aggregator)
@@ -66,7 +66,7 @@ Writing directly to target resolution tables under high load triggers high write
 * **Coordinator Merge**: Worker index `0` acts as the coordinator. In addition to staging its own data, it periodically:
   1. Creates a temporary table `stat_pg_temp` by selecting all rows from `stat_pg_staging`.
   2. Instantly runs `TRUNCATE stat_pg_staging` to release lock contention for other workers.
-  3. Inserts and aggregates metrics from `stat_pg_temp` into the final resolution tables (`evt_secs`, `evt_mins`, `evt_hours`, `evt_days`, `evt_30s`).
+  3. Inserts and aggregates metrics from `stat_pg_temp` into the final resolution tables (`stat_pg_secs`, `stat_pg_mins`, `stat_pg_hours`, `stat_pg_days`, `stat_pg_30s`).
   4. Drops `stat_pg_temp`.
 
 ### 5. B-Tree Sequential Insertion Optimization

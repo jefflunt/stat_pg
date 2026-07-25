@@ -31,7 +31,7 @@ docker compose exec db cargo test
 ```
 
 ### 3. Load the Extension
-To run the DDL schema migrations (creating the tables `stat_pg_metrics`, `stat_pg_staging`, `evt_secs`, `evt_mins`, `evt_hours`, `evt_days`, and `evt_30s`), load the extension in PostgreSQL:
+To run the DDL schema migrations (creating the tables `stat_pg_metrics`, `stat_pg_staging`, `stat_pg_secs`, `stat_pg_mins`, `stat_pg_hours`, `stat_pg_days`, and `stat_pg_30s`), load the extension in PostgreSQL:
 ```bash
 docker compose exec db psql -U postgres -c "CREATE EXTENSION stat_pg;"
 ```
