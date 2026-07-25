@@ -977,7 +977,7 @@ fn main() {
     let mut final_udp_received = 0i64;
     let mut final_udp_dropped = 0i64;
     let mut final_ebpf_items = 0i64;
-    let mut avg_merge_latency = 0.0f64;
+    let avg_merge_latency = 0.0f64;
     if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
         if let Ok(row) = client.query_one("SELECT received, dropped, ebpf_items FROM stat_pg_udp_stats();", &[]) {
             final_udp_received = row.get(0);
