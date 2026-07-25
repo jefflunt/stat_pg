@@ -4,8 +4,9 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     container_name: stat-pg-db
-    command: ["postgres", "-c", "shared_preload_libraries=stat_pg", "-c", "stat_pg.workers=4", "-c", "max_worker_processes=16"]
+    command: ["postgres", "-c", "shared_preload_libraries=stat_pg", "-c", "stat_pg.workers=8", "-c", "max_worker_processes=16"]
     mem_limit: 64g
+    privileged: true
     environment:
       POSTGRES_PASSWORD: postgres
       USER: postgres

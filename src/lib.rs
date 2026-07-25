@@ -423,9 +423,9 @@ fn recvmmsg_sys(
     use std::os::unix::io::AsRawFd;
     let fd = socket.as_raw_fd();
     let num_buffers = bufs.len();
-    assert!(num_buffers <= 32, "recvmmsg_sys only supports up to 32 buffers");
+    assert!(num_buffers <= 128, "recvmmsg_sys only supports up to 128 buffers");
 
-    let mut iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 32];
+    let mut iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 128];
     let mut mmsg = [libc::mmsghdr {
         msg_hdr: libc::msghdr {
             msg_name: std::ptr::null_mut(),
@@ -437,7 +437,7 @@ fn recvmmsg_sys(
             msg_flags: 0,
         },
         msg_len: 0,
-    }; 32];
+    }; 128];
 
     for i in 0..num_buffers {
         iovecs[i].iov_base = bufs[i].as_mut_ptr() as *mut libc::c_void;
@@ -862,8 +862,8 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
             return;
         }
 
-        let mut bufs = vec![[0u8; 2048]; 32];
-        let mut lengths = vec![0; 32];
+        let mut bufs = vec![[0u8; 2048]; 128];
+        let mut lengths = vec![0; 128];
 
         while running_thread.load(Ordering::Relaxed) {
             match recv_batch_blocking(&socket, &mut bufs, &mut lengths) {
