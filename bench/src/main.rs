@@ -390,8 +390,8 @@ fn main() {
     // Automatically truncate and vacuum database tables before registering metrics
     println!("Database cleanup: Truncating event tables and vacuuming...");
     if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
-        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, evt_secs, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups RESTART IDENTITY CASCADE;", &[]);
-        let _ = client.execute("VACUUM ANALYZE stat_pg_metrics, evt_secs, evt_mins, evt_hours, evt_days, evt_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups;", &[]);
+        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, stat_pg_secs, stat_pg_mins, stat_pg_hours, stat_pg_days, stat_pg_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups RESTART IDENTITY CASCADE;", &[]);
+        let _ = client.execute("VACUUM ANALYZE stat_pg_metrics, stat_pg_secs, stat_pg_mins, stat_pg_hours, stat_pg_days, stat_pg_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups;", &[]);
     }
 
     // Register all simulated metric names in the database and retrieve their IDs
@@ -962,7 +962,7 @@ fn main() {
     println!("Performing Final Database Consistency Validation...");
     println!("==================================================");
 
-    let tables = ["evt_secs", "evt_mins", "evt_hours", "evt_days", "evt_30s"];
+    let tables = ["stat_pg_secs", "stat_pg_mins", "stat_pg_hours", "stat_pg_days", "stat_pg_30s"];
     let mut table_sums = HashMap::new();
 
     for table in &tables {
@@ -1002,7 +1002,7 @@ fn main() {
     let diff_udp_received = final_udp_received - initial_udp_received;
     let diff_udp_dropped = final_udp_dropped - initial_udp_dropped;
 
-    let target_sum = table_sums.get("evt_secs").cloned().unwrap_or(0.0);
+    let target_sum = table_sums.get("stat_pg_secs").cloned().unwrap_or(0.0);
     let delivery_rate = if total_sent > 0 {
         (total_processed as f64 / total_sent as f64) * 100.0
     } else {
@@ -1024,7 +1024,7 @@ fn main() {
         0.0
     };
     println!("  - Kernel Ingestion Success Rate: {:.2}%", udp_success_rate);
-    println!("Persisted SUM(evt_secs)        : {}", format_number(target_sum as u64));
+    println!("Persisted SUM(stat_pg_secs)   : {}", format_number(target_sum as u64));
 
     let mut mismatch = false;
     for table in &tables {
@@ -1053,11 +1053,11 @@ fn main() {
         FROM (
             VALUES 
                 ('stat_pg_metrics'),
-                ('evt_secs'),
-                ('evt_mins'),
-                ('evt_hours'),
-                ('evt_days'),
-                ('evt_30s'),
+                ('stat_pg_secs'),
+                ('stat_pg_mins'),
+                ('stat_pg_hours'),
+                ('stat_pg_days'),
+                ('stat_pg_30s'),
                 ('stat_pg_processed'),
                 ('stat_pg_rollups')
         ) as t(table_name);

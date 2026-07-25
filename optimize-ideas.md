@@ -33,11 +33,12 @@ This document outlines architectural, system-level, and software-level strategie
 ### 5. Concurrent Multi-Worker Background Rollups (Candidate 3)
 *   **Status**: **IMPLEMENTED**
 *   **Core Concept**: Parallelize the background rollup execution using multiple background workers to prevent index/lock contention.
-*   **Mechanism**: Partitioned database tasks across background workers:
-    *   Worker 0: performs staging merges (`staging_merge`) into `evt_secs`.
-    *   Worker 1: performs minute rollups (`rollup_minutes`) into `evt_mins`.
-    *   Worker 2: performs hour rollups (`rollup_hours`) into `evt_hours`.
-    *   Worker 3: performs day/30d rollups (`rollup_days`) into `evt_days` / `evt_30s`.
+*   **Mechanism**: The background worker flushes only to `stat_pg_secs` every second. Conditional checks lazy-aggregate up the chronological hierarchy (`stat_pg_mins -> stat_pg_hours -> stat_pg_days -> stat_pg_30s`) upon minute/hour/day epoch transitions.
+*   **Dedicated Worker Pipeline**: Assign specialized responsibilities to individual worker IDs:
+    *   Worker 0: performs staging merges (`staging_merge`) into `stat_pg_secs`.
+    *   Worker 1: performs minute rollups (`rollup_minutes`) into `stat_pg_mins`.
+    *   Worker 2: performs hour rollups (`rollup_hours`) into `stat_pg_hours`.
+    *   Worker 3: performs day/30d rollups (`rollup_days`) into `stat_pg_days` / `stat_pg_30s`.
     *   Watermark Synchronization: Workers check `stat_pg_rollups` metadata to ensure lower-tier tables are fully aggregated before performing the next rollup tier, preventing race conditions.
 *   **Results**: A completely lock-free parallel write pipeline, ensuring zero write-write conflicts across tables.
 

@@ -112,11 +112,11 @@ On the server side a 5-second aggregation ring buffer is keps in RAM in order to
          +--> [ SPI Parameterized Upsert Transactions ]
          |
          +--> [ DB ROLLUP TABLES ]
-              ├── evt_secs (at = 100)
-              ├── evt_mins (at = 100 / 60)
-              ├── evt_hours (at = 100 / 3600)
-              ├── evt_days (at = 100 / 86400)
-              └── evt_30s (at = 100 / 2592000)
+              ├── stat_pg_secs (at = 100)
+              ├── stat_pg_mins (at = 100 / 60)
+              ├── stat_pg_hours (at = 100 / 3600)
+              ├── stat_pg_days (at = 100 / 86400)
+              └── stat_pg_30s (at = 100 / 2592000)
 ```
 
 ### Network Protocol Format
@@ -179,7 +179,7 @@ You can verify the TCP pipeline manually by executing a Python one-liner on your
 
 1. **Verify tables are empty**:
    ```bash
-   docker compose exec db psql -U postgres -c "SELECT * FROM evt_secs;"
+   docker compose exec db psql -U postgres -c "SELECT * FROM stat_pg_secs;"
    ```
 2. **Send binary packets over TCP** using a Python one-liner:
    ```bash
@@ -197,11 +197,11 @@ You can verify the TCP pipeline manually by executing a Python one-liner on your
    s.close()
    '
    ```
-3. **Wait 1 second** (to trigger the flush interval) and query the seconds resolution table. Since metric names are normalized to IDs internally, join `evt_secs` with the lookup table:
+3. **Wait 1 second** (to trigger the flush interval) and query the seconds resolution table. Since metric names are normalized to IDs internally, join `stat_pg_secs` with the lookup table:
    ```bash
    docker compose exec db psql -U postgres -c "
    SELECT m.name as code, e.at, e.value 
-   FROM evt_secs e 
+   FROM stat_pg_secs e 
    JOIN stat_pg_metrics m ON e.metric_id = m.id;
    "
    ```

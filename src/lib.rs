@@ -18,31 +18,31 @@ extension_sql!(
         name VARCHAR NOT NULL UNIQUE,
         type VARCHAR NOT NULL DEFAULT 'numeric'
     );
-    CREATE TABLE IF NOT EXISTS evt_secs (
+    CREATE TABLE IF NOT EXISTS stat_pg_secs (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (at, metric_id)
     );
-    CREATE TABLE IF NOT EXISTS evt_mins (
+    CREATE TABLE IF NOT EXISTS stat_pg_mins (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (at, metric_id)
     );
-    CREATE TABLE IF NOT EXISTS evt_hours (
+    CREATE TABLE IF NOT EXISTS stat_pg_hours (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (at, metric_id)
     );
-    CREATE TABLE IF NOT EXISTS evt_days (
+    CREATE TABLE IF NOT EXISTS stat_pg_days (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (at, metric_id)
     );
-    CREATE TABLE IF NOT EXISTS evt_30s (
+    CREATE TABLE IF NOT EXISTS stat_pg_30s (
         metric_id INT NOT NULL,
         at BIGINT NOT NULL,
         value DOUBLE PRECISION NOT NULL,
@@ -64,7 +64,7 @@ extension_sql!(
         last_aggregated_at BIGINT NOT NULL
     );
     "#,
-    name = "create_evt_tables"
+    name = "create_stat_pg_tables"
 );
 
 // GUC configuration settings
@@ -236,12 +236,12 @@ fn staging_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
     )?;
     client.update("TRUNCATE stat_pg_staging;", None, &[])?;
 
-    // 2. Merge into evt_secs from temp table
+    // 2. Merge into stat_pg_secs from temp table
     client.update(
-        "INSERT INTO evt_secs (metric_id, at, value)
+        "INSERT INTO stat_pg_secs (metric_id, at, value)
          SELECT metric_id, at, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at
          ORDER BY at, metric_id
-         ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_secs.value + EXCLUDED.value;",
+         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_secs.value + EXCLUDED.value;",
         None, &[]
     )?;
 
@@ -280,13 +280,13 @@ fn rollup_minutes(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
         let start_at = last_min * 60;
         let end_at = current_min * 60;
         let query = format!(
-            "INSERT INTO evt_mins (metric_id, at, value) \
+            "INSERT INTO stat_pg_mins (metric_id, at, value) \
              SELECT metric_id, at / 60, SUM(value) \
-             FROM evt_secs \
+             FROM stat_pg_secs \
              WHERE at >= {} AND at < {} \
              GROUP BY metric_id, at / 60 \
              ORDER BY at / 60, metric_id \
-             ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_mins.value + EXCLUDED.value;",
+             ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_mins.value + EXCLUDED.value;",
             start_at, end_at
         );
         client.update(&query, None, &[])?;
@@ -319,13 +319,13 @@ fn rollup_hours(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
             let start_at = last_hour * 60;
             let end_at = current_hour * 60;
             let query = format!(
-                "INSERT INTO evt_hours (metric_id, at, value) \
+                "INSERT INTO stat_pg_hours (metric_id, at, value) \
                  SELECT metric_id, at / 60, SUM(value) \
-                 FROM evt_mins \
+                 FROM stat_pg_mins \
                  WHERE at >= {} AND at < {} \
                  GROUP BY metric_id, at / 60 \
                  ORDER BY at / 60, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_hours.value + EXCLUDED.value;",
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_hours.value + EXCLUDED.value;",
                 start_at, end_at
             );
             client.update(&query, None, &[])?;
@@ -359,13 +359,13 @@ fn rollup_days(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
             let start_at = last_day * 24;
             let end_at = current_day * 24;
             let query = format!(
-                "INSERT INTO evt_days (metric_id, at, value) \
+                "INSERT INTO stat_pg_days (metric_id, at, value) \
                  SELECT metric_id, at / 24, SUM(value) \
-                 FROM evt_hours \
+                 FROM stat_pg_hours \
                  WHERE at >= {} AND at < {} \
                  GROUP BY metric_id, at / 24 \
                  ORDER BY at / 24, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_days.value + EXCLUDED.value;",
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;",
                 start_at, end_at
             );
             client.update(&query, None, &[])?;
@@ -391,13 +391,13 @@ fn rollup_days(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
             let start_at = last_30d * 30;
             let end_at = current_30d * 30;
             let query = format!(
-                "INSERT INTO evt_30s (metric_id, at, value) \
+                "INSERT INTO stat_pg_30s (metric_id, at, value) \
                  SELECT metric_id, at / 30, SUM(value) \
-                 FROM evt_days \
+                 FROM stat_pg_days \
                  WHERE at >= {} AND at < {} \
                  GROUP BY metric_id, at / 30 \
                  ORDER BY at / 30, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_30s.value + EXCLUDED.value;",
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;",
                 start_at, end_at
             );
             client.update(&query, None, &[])?;
@@ -956,6 +956,12 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     )?.first().get_one()?.unwrap_or(0);
 
                     max_valid_id.store(db_max_id, Ordering::Relaxed);
+                    {
+                        let mut active = active_buffer.lock().unwrap();
+                        if active.len() < db_max_id as usize + 1 {
+                            active.resize(db_max_id as usize + 1, 0.0);
+                        }
+                    }
 
                     // 2. Flush slot data
                     flush_slot(client, at, &local_flush_buffer)?;
@@ -1055,19 +1061,19 @@ fn stat_pg_udp_stats() -> TableIterator<'static, (name!(received, i64), name!(dr
 fn stat_pg_force_rollups() -> Result<(), pgrx::spi::Error> {
     Spi::connect_mut(|client| {
         // 1. Truncate all rollup tables to prevent double-counting upon clean rebuild
-        client.update("TRUNCATE evt_mins, evt_hours, evt_days, evt_30s, stat_pg_rollups;", None, &[])?;
+        client.update("TRUNCATE stat_pg_mins, stat_pg_hours, stat_pg_days, stat_pg_30s, stat_pg_rollups;", None, &[])?;
 
-        // 2. Force Minute Rollup from evt_secs
-        let max_sec: Option<i64> = client.select("SELECT MAX(at) FROM evt_secs;", None, &[])?.first().get_one()?;
+        // 2. Force Minute Rollup from stat_pg_secs
+        let max_sec: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_secs;", None, &[])?.first().get_one()?;
         if let Some(ms) = max_sec {
             let current_min = ms / 60 + 1;
             let query = format!(
-                "INSERT INTO evt_mins (metric_id, at, value) \
+                "INSERT INTO stat_pg_mins (metric_id, at, value) \
                  SELECT metric_id, at / 60, SUM(value) \
-                 FROM evt_secs \
+                 FROM stat_pg_secs \
                  GROUP BY metric_id, at / 60 \
                  ORDER BY at / 60, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_mins.value + EXCLUDED.value;"
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_mins.value + EXCLUDED.value;"
             );
             client.update(&query, None, &[])?;
             client.update(
@@ -1077,17 +1083,17 @@ fn stat_pg_force_rollups() -> Result<(), pgrx::spi::Error> {
             )?;
         }
 
-        // 3. Force Hour Rollup from evt_mins
-        let max_min: Option<i64> = client.select("SELECT MAX(at) FROM evt_mins;", None, &[])?.first().get_one()?;
+        // 3. Force Hour Rollup from stat_pg_mins
+        let max_min: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_mins;", None, &[])?.first().get_one()?;
         if let Some(mm) = max_min {
             let current_hour = mm / 60 + 1;
             let query = format!(
-                "INSERT INTO evt_hours (metric_id, at, value) \
+                "INSERT INTO stat_pg_hours (metric_id, at, value) \
                  SELECT metric_id, at / 60, SUM(value) \
-                 FROM evt_mins \
+                 FROM stat_pg_mins \
                  GROUP BY metric_id, at / 60 \
                  ORDER BY at / 60, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_hours.value + EXCLUDED.value;"
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_hours.value + EXCLUDED.value;"
             );
             client.update(&query, None, &[])?;
             client.update(
@@ -1097,17 +1103,17 @@ fn stat_pg_force_rollups() -> Result<(), pgrx::spi::Error> {
             )?;
         }
 
-        // 4. Force Day Rollup from evt_hours
-        let max_hour: Option<i64> = client.select("SELECT MAX(at) FROM evt_hours;", None, &[])?.first().get_one()?;
+        // 4. Force Day Rollup from stat_pg_hours
+        let max_hour: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_hours;", None, &[])?.first().get_one()?;
         if let Some(mh) = max_hour {
             let current_day = mh / 24 + 1;
             let query = format!(
-                "INSERT INTO evt_days (metric_id, at, value) \
+                "INSERT INTO stat_pg_days (metric_id, at, value) \
                  SELECT metric_id, at / 24, SUM(value) \
-                 FROM evt_hours \
+                 FROM stat_pg_hours \
                  GROUP BY metric_id, at / 24 \
                  ORDER BY at / 24, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_days.value + EXCLUDED.value;"
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;"
             );
             client.update(&query, None, &[])?;
             client.update(
@@ -1117,17 +1123,17 @@ fn stat_pg_force_rollups() -> Result<(), pgrx::spi::Error> {
             )?;
         }
 
-        // 5. Force 30d Rollup from evt_days
-        let max_day: Option<i64> = client.select("SELECT MAX(at) FROM evt_days;", None, &[])?.first().get_one()?;
+        // 5. Force 30d Rollup from stat_pg_days
+        let max_day: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_days;", None, &[])?.first().get_one()?;
         if let Some(md) = max_day {
             let current_30d = md / 30 + 1;
             let query = format!(
-                "INSERT INTO evt_30s (metric_id, at, value) \
+                "INSERT INTO stat_pg_30s (metric_id, at, value) \
                  SELECT metric_id, at / 30, SUM(value) \
-                 FROM evt_days \
+                 FROM stat_pg_days \
                  GROUP BY metric_id, at / 30 \
                  ORDER BY at / 30, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = evt_30s.value + EXCLUDED.value;"
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;"
             );
             client.update(&query, None, &[])?;
             client.update(
@@ -1166,7 +1172,7 @@ mod tests {
 
             // Query check for seconds
             let val = client.select(
-                "SELECT value::float8 FROM evt_secs WHERE metric_id = 1 AND at = 1000;",
+                "SELECT value::float8 FROM stat_pg_secs WHERE metric_id = 1 AND at = 1000;",
                 None, &[]
             ).expect("Select failed")
             .first()
@@ -1186,7 +1192,7 @@ mod tests {
 
             // Query check again (value should be aggregated: 4.5 + 5.5 = 10.0)
             let val2 = client.select(
-                "SELECT value::float8 FROM evt_secs WHERE metric_id = 1 AND at = 1000;",
+                "SELECT value::float8 FROM stat_pg_secs WHERE metric_id = 1 AND at = 1000;",
                 None, &[]
             ).expect("Select failed")
             .first()
