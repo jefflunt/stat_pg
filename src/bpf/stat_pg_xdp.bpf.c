@@ -43,56 +43,46 @@ int stat_pg_xdp_prog(struct xdp_md *ctx) {
     if ((void *)(payload + 4) > data_end)
         return XDP_PASS;
 
-    unsigned char format = payload[1];
-    unsigned char *curr = payload + 4;
+    unsigned char *curr = payload + 1;
+    unsigned char current_fmt = payload[1];
 
-    if (format == 0) { // INC format (2 bytes per update: u16 id, implicit +1)
-        #pragma clang loop unroll(disable)
-        for (int i = 0; i < 64; i++) {
-            if ((void *)(curr + 2) > data_end)
-                break;
+    #pragma clang loop unroll(disable)
+    for (int step = 0; step < 8; step++) {
+        if ((void *)(curr + 4) > data_end)
+            break;
 
-            __u32 id = curr[0] | ((__u32)curr[1] << 8);
-            curr += 2;
-
-            if (id > 0 && id < 65536) {
-                __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
-                if (v) {
-                    *v += 1;
-                }
-            }
-        }
-    } else if (format == 1) { // DEC format (2 bytes per update: u16 id, implicit -1)
-        #pragma clang loop unroll(disable)
-        for (int i = 0; i < 64; i++) {
-            if ((void *)(curr + 2) > data_end)
-                break;
-
-            __u32 id = curr[0] | ((__u32)curr[1] << 8);
-            curr += 2;
-
-            if (id > 0 && id < 65536) {
-                __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
-                if (v && *v > 0) {
-                    *v -= 1;
-                }
-            }
-        }
-    } else if (format == 4 || format == 5) { // INT/UINT16 value (4 bytes per update: u16 id, u16 val)
-        #pragma clang loop unroll(disable)
-        for (int i = 0; i < 64; i++) {
+        unsigned char header_byte = curr[0];
+        if (header_byte < 16) {
+            current_fmt = header_byte;
+            curr += 3;
             if ((void *)(curr + 4) > data_end)
                 break;
+        }
 
+        if (current_fmt == 0) { // INC format: 2 bytes per update (u16 id, implicit +1)
+            __u32 id = curr[0] | ((__u32)curr[1] << 8);
+            curr += 2;
+
+            if (id > 0 && id < 65536) {
+                __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
+                if (v) { *v += 1; }
+            }
+        } else if (current_fmt == 1) { // DEC format: 2 bytes per update (u16 id, implicit -1)
+            __u32 id = curr[0] | ((__u32)curr[1] << 8);
+            curr += 2;
+
+            if (id > 0 && id < 65536) {
+                __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
+                if (v && *v > 0) { *v -= 1; }
+            }
+        } else { // VALUE formats (4 bytes: u16 id, u16 val)
             __u32 id = curr[0] | ((__u32)curr[1] << 8);
             __u16 val = curr[2] | ((__u16)curr[3] << 8);
             curr += 4;
 
             if (id > 0 && id < 65536) {
                 __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
-                if (v) {
-                    *v += val;
-                }
+                if (v) { *v += val; }
             }
         }
     }
