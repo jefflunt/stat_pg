@@ -3,7 +3,7 @@ use pgrx::prelude::*;
 use pgrx::guc::*;
 use pgrx::spi::SpiClient;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::thread;
@@ -984,6 +984,8 @@ extern "C" {
     fn bpf_obj_get(pathname: *const libc::c_char) -> libc::c_int;
 }
 
+static EBPF_TOTAL_ITEMS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+
 fn read_ebpf_map_metrics(flush_buf: &mut [f64]) {
     let path = match CString::new("/sys/fs/bpf/metrics_map") {
         Ok(p) => p,
@@ -998,6 +1000,51 @@ fn read_ebpf_map_metrics(flush_buf: &mut [f64]) {
     }
 
     let mut percpu_vals = vec![0u64; 256];
+
+    // Read Key 0 (Total Item Counter)
+    let key_u32 = 0u32;
+    let map_fd_u32 = fd as u32;
+    let key_ptr = &key_u32 as *const _ as u64;
+    let val_ptr = percpu_vals.as_mut_ptr() as u64;
+
+    let mut attr_lookup = [0u8; 32];
+    unsafe {
+        std::ptr::copy_nonoverlapping(&map_fd_u32 as *const u32 as *const u8, attr_lookup.as_mut_ptr(), 4);
+        std::ptr::copy_nonoverlapping(&key_ptr as *const u64 as *const u8, attr_lookup.as_mut_ptr().add(8), 8);
+        std::ptr::copy_nonoverlapping(&val_ptr as *const u64 as *const u8, attr_lookup.as_mut_ptr().add(16), 8);
+    }
+
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            1, // BPF_MAP_LOOKUP_ELEM
+            attr_lookup.as_ptr() as *const libc::c_void,
+            32u32,
+        )
+    };
+
+    if res == 0 {
+        let items: u64 = percpu_vals.iter().cloned().fold(0u64, |a, b| a.saturating_add(b));
+        if items > 0 {
+            EBPF_TOTAL_ITEMS_RECEIVED.fetch_add(items, Ordering::Relaxed);
+
+            percpu_vals.fill(0);
+            let mut attr_update = [0u8; 32];
+            unsafe {
+                std::ptr::copy_nonoverlapping(&map_fd_u32 as *const u32 as *const u8, attr_update.as_mut_ptr(), 4);
+                std::ptr::copy_nonoverlapping(&key_ptr as *const u64 as *const u8, attr_update.as_mut_ptr().add(8), 8);
+                std::ptr::copy_nonoverlapping(&val_ptr as *const u64 as *const u8, attr_update.as_mut_ptr().add(16), 8);
+
+                libc::syscall(
+                    libc::SYS_bpf,
+                    2, // BPF_MAP_UPDATE_ELEM
+                    attr_update.as_ptr() as *const libc::c_void,
+                    32u32,
+                );
+            }
+        }
+    }
+
     let mut total_ebpf_count = 0u64;
 
     for key in 1..flush_buf.len() {
@@ -1049,7 +1096,6 @@ fn read_ebpf_map_metrics(flush_buf: &mut [f64]) {
     if total_ebpf_count > 0 {
         eprintln!("stat-pg: successfully flushed {} metrics from eBPF kernel map to database", total_ebpf_count);
     }
-
     unsafe { libc::close(fd); }
 }
 
@@ -1351,7 +1397,7 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
 }
 
 #[pg_extern]
-fn stat_pg_udp_stats() -> TableIterator<'static, (name!(received, i64), name!(dropped, i64))> {
+fn stat_pg_udp_stats() -> TableIterator<'static, (name!(received, i64), name!(dropped, i64), name!(ebpf_items, i64))> {
     let mut received = 0;
     let mut dropped = 0;
     if let Ok(content) = std::fs::read_to_string("/proc/net/snmp") {
@@ -1365,7 +1411,8 @@ fn stat_pg_udp_stats() -> TableIterator<'static, (name!(received, i64), name!(dr
             }
         }
     }
-    TableIterator::new(vec![(received, dropped)].into_iter())
+    let ebpf_items = EBPF_TOTAL_ITEMS_RECEIVED.load(Ordering::Relaxed) as i64;
+    TableIterator::new(vec![(received, dropped, ebpf_items)].into_iter())
 }
 
 #[pg_extern]

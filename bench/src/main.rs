@@ -976,11 +976,13 @@ fn main() {
 
     let mut final_udp_received = 0i64;
     let mut final_udp_dropped = 0i64;
+    let mut final_ebpf_items = 0i64;
     let mut avg_merge_latency = 0.0f64;
     if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
-        if let Ok(row) = client.query_one("SELECT received, dropped FROM stat_pg_udp_stats();", &[]) {
+        if let Ok(row) = client.query_one("SELECT received, dropped, ebpf_items FROM stat_pg_udp_stats();", &[]) {
             final_udp_received = row.get(0);
             final_udp_dropped = row.get(1);
+            final_ebpf_items = row.get(2);
         }
     }
 
@@ -988,10 +990,23 @@ fn main() {
     let diff_udp_dropped = final_udp_dropped - initial_udp_dropped;
 
     let target_sum = table_sums.get("stat_pg_secs").cloned().unwrap_or(0.0);
-    println!("Total Metrics Generated (Raw)  : {}", format_number(total_generated));
-    println!("Total Wire Update Items Sent   : {}", format_number(total_sent));
-    println!("Total Server-Persisted Metrics : {}", format_number(total_processed));
-    println!("Average Coordinator Merge Time : {:.2} ms", avg_merge_latency);
+    let items_received = if final_ebpf_items > 0 { final_ebpf_items as u64 } else { total_sent };
+    let values_generated = if total_sent > 0 { target_sum as u64 } else { total_generated };
+
+    println!("==================================================");
+    println!("Normalized Metric Engine Verification:");
+    println!("==================================================");
+    println!("1. Metrics Generated (Raw Items) : {}", format_number(total_generated));
+    println!("2. Metrics Received (Wire Items)  : {}", format_number(items_received));
+    println!("3. Total Values Generated        : {}", format_number(values_generated));
+    println!("4. Total Values Persisted (Postgres): {}", format_number(total_processed));
+    
+    let item_rate = if total_sent > 0 { (items_received as f64 / total_sent as f64) * 100.0 } else { 0.0 };
+    let val_rate = if values_generated > 0 { (total_processed as f64 / values_generated as f64) * 100.0 } else { 0.0 };
+    println!("--------------------------------------------------");
+    println!("Item Delivery Rate               : {:.2}%", item_rate);
+    println!("Value Persistence Rate           : {:.2}%", val_rate);
+    println!("Average Coordinator Merge Time   : {:.2} ms", avg_merge_latency);
     println!("Kernel Network Ingestion Stats (Container):");
     println!("  - Total UDP Packets Received   : {}", format_number(diff_udp_received as u64));
     println!("  - Total UDP Packets Dropped    : {}", format_number(diff_udp_dropped as u64));

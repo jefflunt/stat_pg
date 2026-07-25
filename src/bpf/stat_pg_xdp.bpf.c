@@ -47,6 +47,8 @@ int stat_pg_xdp_prog(struct xdp_md *ctx) {
     __u16 num_updates = payload[2] | ((__u16)payload[3] << 8);
     unsigned char *curr = payload + 4;
 
+    __u32 zero_key = 0;
+
     if (fmt == 0) { // 16-bit ID INC (+1, 2 bytes)
         #pragma clang loop unroll(disable)
         for (int i = 0; i < 64; i++) {
@@ -57,6 +59,8 @@ int stat_pg_xdp_prog(struct xdp_md *ctx) {
             if (id > 0 && id < 65536) {
                 __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
                 if (v) { *v += 1; }
+                __u64 *cnt = bpf_map_lookup_elem(&metrics_map, &zero_key);
+                if (cnt) { *cnt += 1; }
             }
         }
     } else if (fmt == 1) { // 16-bit ID DEC (-1, 2 bytes)
@@ -69,6 +73,8 @@ int stat_pg_xdp_prog(struct xdp_md *ctx) {
             if (id > 0 && id < 65536) {
                 __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
                 if (v && *v > 0) { *v -= 1; }
+                __u64 *cnt = bpf_map_lookup_elem(&metrics_map, &zero_key);
+                if (cnt) { *cnt += 1; }
             }
         }
     } else if (fmt == 2 || fmt == 3) { // 16-bit ID, 8-bit val (3 bytes)
@@ -82,6 +88,8 @@ int stat_pg_xdp_prog(struct xdp_md *ctx) {
             if (id > 0 && id < 65536) {
                 __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
                 if (v) { *v += val; }
+                __u64 *cnt = bpf_map_lookup_elem(&metrics_map, &zero_key);
+                if (cnt) { *cnt += 1; }
             }
         }
     } else if (fmt >= 4 && fmt <= 7) { // 16-bit ID, 16-bit val (4 bytes)
@@ -95,6 +103,8 @@ int stat_pg_xdp_prog(struct xdp_md *ctx) {
             if (id > 0 && id < 65536) {
                 __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
                 if (v) { *v += val; }
+                __u64 *cnt = bpf_map_lookup_elem(&metrics_map, &zero_key);
+                if (cnt) { *cnt += 1; }
             }
         }
     } else if (fmt >= 8 && fmt <= 11) { // 16-bit ID, 32-bit val (6 bytes)
@@ -108,6 +118,8 @@ int stat_pg_xdp_prog(struct xdp_md *ctx) {
             if (id > 0 && id < 65536) {
                 __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
                 if (v) { *v += val; }
+                __u64 *cnt = bpf_map_lookup_elem(&metrics_map, &zero_key);
+                if (cnt) { *cnt += 1; }
             }
         }
     } else if (fmt >= 12 && fmt <= 15) { // 16-bit ID, 64-bit val (10 bytes)
@@ -122,6 +134,8 @@ int stat_pg_xdp_prog(struct xdp_md *ctx) {
             if (id > 0 && id < 65536) {
                 __u64 *v = bpf_map_lookup_elem(&metrics_map, &id);
                 if (v) { *v += val; }
+                __u64 *cnt = bpf_map_lookup_elem(&metrics_map, &zero_key);
+                if (cnt) { *cnt += 1; }
             }
         }
     }
