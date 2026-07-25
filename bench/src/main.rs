@@ -562,6 +562,14 @@ fn main() {
                         }
                     }
                     local_generated += batch_size as u64;
+                    let mut batch_sum_val = 0u64;
+                    for &metric_idx in &touched {
+                        let val = local_values[metric_idx];
+                        if val > 0.0 {
+                            batch_sum_val += val as u64;
+                        }
+                    }
+                    local_metrics += batch_sum_val;
 
                     // Serialize aggregated values
                     let mut format_buffers = vec![Vec::new(); 16];
@@ -636,18 +644,6 @@ fn main() {
                         |packet_data| {
                             let _ = socket.send(packet_data);
                             local_packets += 1;
-                            
-                            let mut updates_in_packet = 0u64;
-                            let num_segs = packet_data[0] as usize;
-                            let mut off = 1;
-                            for _ in 0..num_segs {
-                                if off + 3 > packet_data.len() { break; }
-                                let f = packet_data[off];
-                                let count = unsafe { std::ptr::read_unaligned(packet_data.as_ptr().add(off + 1) as *const u16) } as usize;
-                                updates_in_packet += count as u64;
-                                off += 3 + count * FORMAT_WIDTHS[f as usize];
-                            }
-                            local_metrics += updates_in_packet;
                             local_bytes += packet_data.len() as u64;
                         }
                     );
@@ -656,18 +652,6 @@ fn main() {
                         current_packet.buf[0] = current_packet.num_segments;
                         let _ = socket.send(&current_packet.buf);
                         local_packets += 1;
-                        
-                        let mut updates_in_packet = 0u64;
-                        let num_segs = current_packet.buf[0] as usize;
-                        let mut off = 1;
-                        for _ in 0..num_segs {
-                            if off + 3 > current_packet.buf.len() { break; }
-                            let f = current_packet.buf[off];
-                            let count = unsafe { std::ptr::read_unaligned(current_packet.buf.as_ptr().add(off + 1) as *const u16) } as usize;
-                            updates_in_packet += count as u64;
-                            off += 3 + count * FORMAT_WIDTHS[f as usize];
-                        }
-                        local_metrics += updates_in_packet;
                         local_bytes += current_packet.buf.len() as u64;
                     }
 
@@ -1004,17 +988,9 @@ fn main() {
     let diff_udp_dropped = final_udp_dropped - initial_udp_dropped;
 
     let target_sum = table_sums.get("stat_pg_secs").cloned().unwrap_or(0.0);
-    let delivery_rate = if total_sent > 0 {
-        (total_processed as f64 / total_sent as f64) * 100.0
-    } else {
-        0.0
-    };
     println!("Total Metrics Generated (Raw)  : {}", format_number(total_generated));
-    println!("Total Client-Aggregated Metrics: {}", format_number(total_sent));
-    println!("Total Server-Received Metrics  : {} ({:.2}% delivery rate)", 
-        format_number(total_processed), 
-        delivery_rate
-    );
+    println!("Total Wire Update Items Sent   : {}", format_number(total_sent));
+    println!("Total Server-Persisted Metrics : {}", format_number(total_processed));
     println!("Average Coordinator Merge Time : {:.2} ms", avg_merge_latency);
     println!("Kernel Network Ingestion Stats (Container):");
     println!("  - Total UDP Packets Received   : {}", format_number(diff_udp_received as u64));
