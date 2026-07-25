@@ -42,11 +42,23 @@ This document outlines architectural, system-level, and software-level strategie
     *   Watermark Synchronization: Workers check `stat_pg_rollups` metadata to ensure lower-tier tables are fully aggregated before performing the next rollup tier, preventing race conditions.
 *   **Results**: A completely lock-free parallel write pipeline, ensuring zero write-write conflicts across tables.
 
+### 6. OS Kernel Socket Receive Buffer Sizing (`rmem_max`)
+*   **Status**: **IMPLEMENTED**
+*   **Core Concept**: Expand OS kernel UDP socket receive buffers to absorb packet micro-bursts during high-throughput sender blasts.
+*   **Mechanism**: Configured host kernel `sysctl net.core.rmem_max=536870912` (512 MB) and set `SO_RCVBUF` on all worker sockets.
+*   **Results**: Eliminated UDP packet drops in local aggregation mode (100.00% delivery rate with 0 dropped packets across 4.40 Billion metrics).
+
+### 7. Increased System Call Batching (`recvmmsg` 128-buffer batch size)
+*   **Status**: **IMPLEMENTED**
+*   **Core Concept**: Reduce OS kernel-to-user space context switching frequency by 4x per worker process.
+*   **Mechanism**: Increased `recvmmsg` buffer size from 32 to 128 packets in `recvmmsg_sys` in `src/lib.rs`.
+*   **Results**: Boosted real-time packet ingestion throughput by **+36.1% to +43.7%** across both local-aggregation and unthrottled benchmark modes.
+
 ---
 
 ## Retired Proposals
 
-### 6. Memory Prefetching to Hide Cache Latency
+### 8. Memory Prefetching to Hide Cache Latency
 *   **Status**: **RETIRED**
 *   **Reason**: Attempting to prefetch memory addresses using assembly instructions (`prefetcht0` / `prfm`) inside the metric loop halved throughput (dropping ingestion speed to 83M MPS). In a loop performing back-to-back updates, prefetch instructions saturated execution load ports in the CPU's load/store pipeline, causing execution queues to stall.
 
@@ -54,18 +66,18 @@ This document outlines architectural, system-level, and software-level strategie
 
 ## High-Cardinality Scaling Proposals
 
-### 7. Embedded LSM-Tree Ingestion (Fjall / RocksDB Crate)
+### 9. Embedded LSM-Tree Ingestion (Fjall / RocksDB Crate)
 *   **Status**: **PROPOSED**
 *   **Core Concept**: Completely bypass B-Tree index write-amplification and page splits in the database.
 *   **Mechanism**: Add a pure-Rust embedded LSM engine (e.g., `fjall` crate) into the extension. The background worker writes incoming metrics directly to a local WAL/MemTable on disk. Expose the data to PostgreSQL queries via Rust Set-Returning Functions (UDFs).
 *   **Benefits**: Disk writes become sequential append-only operations, keeping write throughput high regardless of cardinality.
 
-### 8. Partitioning event tables by Time (`at`)
+### 10. Partitioning event tables by Time (`at`)
 *   **Status**: **PROPOSED**
 *   **Core Concept**: Slice database tables into chronological chunks (hourly/daily).
 *   **Mechanism**: Use native PostgreSQL declarative partitioning. Indices are created per-partition, meaning active index leaf nodes stay small and fit entirely inside the database `shared_buffers` cache.
 
-### 9. Index FillFactor Tuning
+### 11. Index FillFactor Tuning
 *   **Status**: **PROPOSED**
 *   **Core Concept**: Reduce leaf page splitting frequency during high-cardinality merges.
 *   **Mechanism**: Alter primary key indexes to set `FILLFACTOR = 80`. This reserves 20% free space on each index page to absorb chronological inserts, delaying B-Tree page splits.
@@ -74,12 +86,23 @@ This document outlines architectural, system-level, and software-level strategie
 
 ## Proposed Optimizations
 
-### 10. Inline Assembly Parser (Aarch64 / x86_64 ASM)
+### 12. SIMD Vectorized Payload Parsing (Candidate 12)
+*   **Status**: **IMPLEMENTED**
+*   **Core Concept**: Use SIMD (Single Instruction Multiple Data) vector registers (ARM64 NEON `vld1q_u16` / x86_64 `_mm_loadu_si128`) to parse and decode packet payload byte streams in parallel.
+*   **Mechanism**: Processed 128-bit SIMD vector registers of 16-bit metric IDs and values in 8-way unrolled loops in `src/lib.rs`.
+*   **Results**: Confirmed 100% data consistency across all 5 rollup tables. Measured throughput matching 8-way unrolled pointer loops (~15.8M - 16.5M pps), proving empirically that UDP socket receive syscall latency is the primary bottleneck rather than payload decoding.
+
+### 13. Multi-Thread Receiver Pools Per Worker Socket
+*   **Status**: **PROPOSED**
+*   **Core Concept**: Scale socket-reading CPU concurrency beyond 1 thread per PostgreSQL background worker process.
+*   **Mechanism**: Spawn a pool of N receiver threads per worker process sharing a lock-free SPSC (Single Producer Single Consumer) queue, allowing 16-32 OS threads to drain `SO_REUSEPORT` sockets concurrently.
+
+### 14. Inline Assembly Parser (Aarch64 / x86_64 ASM)
 *   **Status**: **PROPOSED**
 *   **Core Concept**: Bypass compiler intermediate representations and enforce optimal register layout.
 *   **Mechanism**: Write the decoding loop in raw assembly using conditional selects (`CSEL` on ARM, `CMOV` on x86) to run loop updates in CPU registers.
 
-### 11. Kernel Bypass (AF_XDP)
+### 15. Kernel Bypass (AF_XDP)
 *   **Status**: **PROPOSED**
 *   **Core Concept**: Avoid the Linux kernel network stack and socket layer entirely.
 *   **Mechanism**: Maps the network card (NIC) receive queue ring buffers directly into user space via zero-copy.

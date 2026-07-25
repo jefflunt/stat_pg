@@ -562,27 +562,147 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 let segment_len = num_updates * 2;
                 if offset + segment_len > n { break; }
                 
-                for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
-                    if id > 0 && id <= max_id && id < active.len() {
+                let active_len = active.len();
+                let mut i = 0;
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    let max_id_u16 = max_id as u16;
+                    let v_max = unsafe { vdupq_n_u16(max_id_u16) };
+                    let v_zero = unsafe { vdupq_n_u16(0) };
+
+                    while i + 8 <= num_updates {
+                        let ptr = unsafe { buf.as_ptr().add(offset + i * 2) as *const u16 };
+                        let v_ids = unsafe { vld1q_u16(ptr) };
+                        let mask_gt0 = unsafe { vcgtq_u16(v_ids, v_zero) };
+                        let mask_le_max = unsafe { vcleq_u16(v_ids, v_max) };
+                        let mask_valid = unsafe { vandq_u16(mask_gt0, mask_le_max) };
+
+                        let mut ids = [0u16; 8];
+                        let mut valid_flags = [0u16; 8];
+                        unsafe {
+                            vst1q_u16(ids.as_mut_ptr(), v_ids);
+                            vst1q_u16(valid_flags.as_mut_ptr(), mask_valid);
+                        }
+
+                        for j in 0..8 {
+                            if valid_flags[j] != 0 {
+                                let id = ids[j] as usize;
+                                if id < active_len {
+                                    unsafe { *active.get_unchecked_mut(id) += 1.0; }
+                                    parsed_count += 1;
+                                }
+                            }
+                        }
+                        i += 8;
+                    }
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use std::arch::x86_64::*;
+                    while i + 8 <= num_updates {
+                        let ptr = unsafe { buf.as_ptr().add(offset + i * 2) as *const u16 };
+                        let mut ids = [0u16; 8];
+                        unsafe {
+                            let v = _mm_loadu_si128(ptr as *const __m128i);
+                            _mm_storeu_si128(ids.as_mut_ptr() as *mut __m128i, v);
+                        }
+
+                        for j in 0..8 {
+                            let id = ids[j] as usize;
+                            if id > 0 && id <= max_id && id < active_len {
+                                unsafe { *active.get_unchecked_mut(id) += 1.0; }
+                                parsed_count += 1;
+                            }
+                        }
+                        i += 8;
+                    }
+                }
+
+                while i < num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + i * 2) as *const u16) } as usize;
+                    if id > 0 && id <= max_id && id < active_len {
                         unsafe { *active.get_unchecked_mut(id) += 1.0; }
                         parsed_count += 1;
                     }
-                    offset += 2;
+                    i += 1;
                 }
+                offset += segment_len;
             }
             1 => {
                 let segment_len = num_updates * 2;
                 if offset + segment_len > n { break; }
                 
-                for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
-                    if id > 0 && id <= max_id && id < active.len() {
+                let active_len = active.len();
+                let mut i = 0;
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    let max_id_u16 = max_id as u16;
+                    let v_max = unsafe { vdupq_n_u16(max_id_u16) };
+                    let v_zero = unsafe { vdupq_n_u16(0) };
+
+                    while i + 8 <= num_updates {
+                        let ptr = unsafe { buf.as_ptr().add(offset + i * 2) as *const u16 };
+                        let v_ids = unsafe { vld1q_u16(ptr) };
+                        let mask_gt0 = unsafe { vcgtq_u16(v_ids, v_zero) };
+                        let mask_le_max = unsafe { vcleq_u16(v_ids, v_max) };
+                        let mask_valid = unsafe { vandq_u16(mask_gt0, mask_le_max) };
+
+                        let mut ids = [0u16; 8];
+                        let mut valid_flags = [0u16; 8];
+                        unsafe {
+                            vst1q_u16(ids.as_mut_ptr(), v_ids);
+                            vst1q_u16(valid_flags.as_mut_ptr(), mask_valid);
+                        }
+
+                        for j in 0..8 {
+                            if valid_flags[j] != 0 {
+                                let id = ids[j] as usize;
+                                if id < active_len {
+                                    unsafe { *active.get_unchecked_mut(id) -= 1.0; }
+                                    parsed_count += 1;
+                                }
+                            }
+                        }
+                        i += 8;
+                    }
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use std::arch::x86_64::*;
+                    while i + 8 <= num_updates {
+                        let ptr = unsafe { buf.as_ptr().add(offset + i * 2) as *const u16 };
+                        let mut ids = [0u16; 8];
+                        unsafe {
+                            let v = _mm_loadu_si128(ptr as *const __m128i);
+                            _mm_storeu_si128(ids.as_mut_ptr() as *mut __m128i, v);
+                        }
+
+                        for j in 0..8 {
+                            let id = ids[j] as usize;
+                            if id > 0 && id <= max_id && id < active_len {
+                                unsafe { *active.get_unchecked_mut(id) -= 1.0; }
+                                parsed_count += 1;
+                            }
+                        }
+                        i += 8;
+                    }
+                }
+
+                while i < num_updates {
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + i * 2) as *const u16) } as usize;
+                    if id > 0 && id <= max_id && id < active_len {
                         unsafe { *active.get_unchecked_mut(id) -= 1.0; }
                         parsed_count += 1;
                     }
-                    offset += 2;
+                    i += 1;
                 }
+                offset += segment_len;
             }
             2 => {
                 let segment_len = num_updates * 3;
@@ -616,29 +736,131 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
                 let segment_len = num_updates * 4;
                 if offset + segment_len > n { break; }
                 
-                for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
-                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const i16) } as f64;
-                    if id > 0 && id <= max_id && id < active.len() {
+                let active_len = active.len();
+                let mut i = 0;
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    while i + 4 <= num_updates {
+                        let ptr = unsafe { buf.as_ptr().add(offset + i * 4) as *const u8 };
+                        let v_data = unsafe { vld1q_u8(ptr) };
+                        let mut chunk = [0u8; 16];
+                        unsafe { vst1q_u8(chunk.as_mut_ptr(), v_data); }
+
+                        for j in 0..4 {
+                            let idx = j * 4;
+                            let id = unsafe { std::ptr::read_unaligned(chunk.as_ptr().add(idx) as *const u16) } as usize;
+                            let val = unsafe { std::ptr::read_unaligned(chunk.as_ptr().add(idx + 2) as *const i16) } as f64;
+                            if id > 0 && id <= max_id && id < active_len {
+                                unsafe { *active.get_unchecked_mut(id) += val; }
+                                parsed_count += 1;
+                            }
+                        }
+                        i += 4;
+                    }
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use std::arch::x86_64::*;
+                    while i + 4 <= num_updates {
+                        let ptr = unsafe { buf.as_ptr().add(offset + i * 4) as *const u8 };
+                        let mut chunk = [0u8; 16];
+                        unsafe {
+                            let v = _mm_loadu_si128(ptr as *const __m128i);
+                            _mm_storeu_si128(chunk.as_mut_ptr() as *mut __m128i, v);
+                        }
+
+                        for j in 0..4 {
+                            let idx = j * 4;
+                            let id = unsafe { std::ptr::read_unaligned(chunk.as_ptr().add(idx) as *const u16) } as usize;
+                            let val = unsafe { std::ptr::read_unaligned(chunk.as_ptr().add(idx + 2) as *const i16) } as f64;
+                            if id > 0 && id <= max_id && id < active_len {
+                                unsafe { *active.get_unchecked_mut(id) += val; }
+                                parsed_count += 1;
+                            }
+                        }
+                        i += 4;
+                    }
+                }
+
+                while i < num_updates {
+                    let base = offset + i * 4;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(base) as *const u16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(base + 2) as *const i16) } as f64;
+                    if id > 0 && id <= max_id && id < active_len {
                         unsafe { *active.get_unchecked_mut(id) += val; }
                         parsed_count += 1;
                     }
-                    offset += 4;
+                    i += 1;
                 }
+                offset += segment_len;
             }
             5 => {
                 let segment_len = num_updates * 4;
                 if offset + segment_len > n { break; }
                 
-                for _ in 0..num_updates {
-                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const u16) } as usize;
-                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset + 2) as *const u16) } as f64;
-                    if id > 0 && id <= max_id && id < active.len() {
+                let active_len = active.len();
+                let mut i = 0;
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    while i + 4 <= num_updates {
+                        let ptr = unsafe { buf.as_ptr().add(offset + i * 4) as *const u8 };
+                        let v_data = unsafe { vld1q_u8(ptr) };
+                        let mut chunk = [0u8; 16];
+                        unsafe { vst1q_u8(chunk.as_mut_ptr(), v_data); }
+
+                        for j in 0..4 {
+                            let idx = j * 4;
+                            let id = unsafe { std::ptr::read_unaligned(chunk.as_ptr().add(idx) as *const u16) } as usize;
+                            let val = unsafe { std::ptr::read_unaligned(chunk.as_ptr().add(idx + 2) as *const u16) } as f64;
+                            if id > 0 && id <= max_id && id < active_len {
+                                unsafe { *active.get_unchecked_mut(id) += val; }
+                                parsed_count += 1;
+                            }
+                        }
+                        i += 4;
+                    }
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use std::arch::x86_64::*;
+                    while i + 4 <= num_updates {
+                        let ptr = unsafe { buf.as_ptr().add(offset + i * 4) as *const u8 };
+                        let mut chunk = [0u8; 16];
+                        unsafe {
+                            let v = _mm_loadu_si128(ptr as *const __m128i);
+                            _mm_storeu_si128(chunk.as_mut_ptr() as *mut __m128i, v);
+                        }
+
+                        for j in 0..4 {
+                            let idx = j * 4;
+                            let id = unsafe { std::ptr::read_unaligned(chunk.as_ptr().add(idx) as *const u16) } as usize;
+                            let val = unsafe { std::ptr::read_unaligned(chunk.as_ptr().add(idx + 2) as *const u16) } as f64;
+                            if id > 0 && id <= max_id && id < active_len {
+                                unsafe { *active.get_unchecked_mut(id) += val; }
+                                parsed_count += 1;
+                            }
+                        }
+                        i += 4;
+                    }
+                }
+
+                while i < num_updates {
+                    let base = offset + i * 4;
+                    let id = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(base) as *const u16) } as usize;
+                    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(base + 2) as *const u16) } as f64;
+                    if id > 0 && id <= max_id && id < active_len {
                         unsafe { *active.get_unchecked_mut(id) += val; }
                         parsed_count += 1;
                     }
-                    offset += 4;
+                    i += 1;
                 }
+                offset += segment_len;
             }
             6 | 7 => {
                 let segment_len = num_updates * 4;
