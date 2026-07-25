@@ -996,10 +996,10 @@ fn main() {
     println!("==================================================");
     println!("Normalized Metric Engine Verification:");
     println!("==================================================");
-    println!("1. Metrics Generated (Raw Items) : {}", format_number(total_generated));
-    println!("2. Metrics Received (Wire Items)  : {}", format_number(items_received));
-    println!("3. Total Values Generated        : {}", format_number(values_generated));
-    println!("4. Total Values Persisted (Postgres): {}", format_number(total_processed));
+    println!("1. Metrics Generated (Raw Items)   : {:>22}", format_number(total_generated));
+    println!("2. Metrics Received (Wire Items)    : {:>22}", format_number(items_received));
+    println!("3. Total Values Generated          : {:>22}", format_number(values_generated));
+    println!("4. Total Values Persisted (Postgres): {:>22}", format_number(total_processed));
     
     let item_rate = if total_sent > 0 { (items_received as f64 / total_sent as f64) * 100.0 } else { 0.0 };
     let val_rate = if values_generated > 0 { (total_processed as f64 / values_generated as f64) * 100.0 } else { 0.0 };
