@@ -627,22 +627,25 @@ fn main() {
 
                     let mut format_buffers_array: [Vec<u8>; 16] = format_buffers.try_into().unwrap();
                     let mut current_packet = PendingPacket::new();
+                    let mut tx_queue: Vec<Vec<u8>> = Vec::with_capacity(32);
 
                     flush_format_buffers(
                         &mut format_buffers_array,
                         &mut current_packet,
                         |packet_data| {
-                            let _ = socket.send(packet_data);
-                            local_packets += 1;
-                            local_bytes += packet_data.len() as u64;
+                            tx_queue.push(packet_data.to_vec());
                         }
                     );
 
                     if current_packet.num_segments > 0 {
                         current_packet.buf[0] = current_packet.num_segments;
-                        let _ = socket.send(&current_packet.buf);
+                        tx_queue.push(current_packet.buf.clone());
+                    }
+
+                    for pkt in tx_queue {
+                        let _ = socket.send(&pkt);
                         local_packets += 1;
-                        local_bytes += current_packet.buf.len() as u64;
+                        local_bytes += pkt.len() as u64;
                     }
 
                     // Reset local aggregators
