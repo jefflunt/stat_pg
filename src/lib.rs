@@ -956,12 +956,6 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     )?.first().get_one()?.unwrap_or(0);
 
                     max_valid_id.store(db_max_id, Ordering::Relaxed);
-                    {
-                        let mut active = active_buffer.lock().unwrap();
-                        if active.len() < db_max_id as usize + 1 {
-                            active.resize(db_max_id as usize + 1, 0.0);
-                        }
-                    }
 
                     // 2. Flush slot data
                     flush_slot(client, at, &local_flush_buffer)?;
