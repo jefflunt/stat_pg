@@ -979,6 +979,81 @@ fn parse_packet_payload(buf: &[u8], max_id: usize, active: &mut [f64]) -> usize 
     parsed_count
 }
 
+#[link(name = "bpf")]
+extern "C" {
+    fn bpf_obj_get(pathname: *const libc::c_char) -> libc::c_int;
+}
+
+fn read_ebpf_map_metrics(flush_buf: &mut [f64]) {
+    let path = match CString::new("/sys/fs/bpf/metrics_map") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let fd = unsafe { bpf_obj_get(path.as_ptr()) };
+
+    if fd < 0 {
+        eprintln!("stat-pg: bpf_obj_get failed: {}", std::io::Error::last_os_error());
+        return;
+    }
+
+    let num_cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize;
+    let mut percpu_vals = vec![0u64; num_cpus];
+    let mut total_ebpf_count = 0u64;
+
+    for key in 1..flush_buf.len() {
+        let key_u32 = key as u32;
+        let map_fd_u32 = fd as u32;
+        let key_ptr = &key_u32 as *const _ as u64;
+        let val_ptr = percpu_vals.as_mut_ptr() as u64;
+
+        let mut attr_lookup = [0u8; 32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(&map_fd_u32 as *const u32 as *const u8, attr_lookup.as_mut_ptr(), 4);
+            std::ptr::copy_nonoverlapping(&key_ptr as *const u64 as *const u8, attr_lookup.as_mut_ptr().add(8), 8);
+            std::ptr::copy_nonoverlapping(&val_ptr as *const u64 as *const u8, attr_lookup.as_mut_ptr().add(16), 8);
+        }
+
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                1, // BPF_MAP_LOOKUP_ELEM
+                attr_lookup.as_ptr() as *const libc::c_void,
+                32u32,
+            )
+        };
+
+        if res == 0 {
+            let sum: u64 = percpu_vals.iter().sum();
+            if sum > 0 {
+                flush_buf[key] += sum as f64;
+                total_ebpf_count += sum;
+
+                percpu_vals.fill(0);
+                let mut attr_update = [0u8; 32];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(&map_fd_u32 as *const u32 as *const u8, attr_update.as_mut_ptr(), 4);
+                    std::ptr::copy_nonoverlapping(&key_ptr as *const u64 as *const u8, attr_update.as_mut_ptr().add(8), 8);
+                    std::ptr::copy_nonoverlapping(&val_ptr as *const u64 as *const u8, attr_update.as_mut_ptr().add(16), 8);
+
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        2, // BPF_MAP_UPDATE_ELEM
+                        attr_update.as_ptr() as *const libc::c_void,
+                        32u32,
+                    );
+                }
+            }
+        }
+    }
+
+    if total_ebpf_count > 0 {
+        eprintln!("stat-pg: successfully flushed {} metrics from eBPF kernel map to database", total_ebpf_count);
+    }
+
+    unsafe { libc::close(fd); }
+}
+
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
@@ -1166,6 +1241,9 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                 }
                 std::mem::swap(&mut *active, &mut local_flush_buffer);
             }
+
+            // If eBPF XDP is active, aggregate BPF map values directly into local_flush_buffer
+            read_ebpf_map_metrics(&mut local_flush_buffer);
 
             let at = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() as i64;
 

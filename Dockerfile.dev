@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     postgresql-server-dev-16 \
+    libbpf-dev \
+    linux-headers-generic \
+    iproute2 \
+    bpftool \
     git \
     && rm -rf /var/lib/apt/lists/*
 

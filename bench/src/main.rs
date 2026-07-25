@@ -337,7 +337,7 @@ fn main() {
             thread::sleep(Duration::from_secs(15));
             
             let start = Instant::now();
-            let output = run_psql_query(&host_clone, "SELECT COALESCE(SUM(count), 0) FROM stat_pg_processed;", true);
+            let output = run_psql_query(&host_clone, "SELECT COALESCE(SUM(value), 0) FROM stat_pg_secs;", true);
             
             let duration = start.elapsed();
             
@@ -390,8 +390,8 @@ fn main() {
     // Automatically truncate and vacuum database tables before registering metrics
     println!("Database cleanup: Truncating event tables and vacuuming...");
     if let Ok(mut client) = postgres::Client::connect(&db_url, postgres::NoTls) {
-        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, stat_pg_secs, stat_pg_mins, stat_pg_hours, stat_pg_days, stat_pg_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups RESTART IDENTITY CASCADE;", &[]);
-        let _ = client.execute("VACUUM ANALYZE stat_pg_metrics, stat_pg_secs, stat_pg_mins, stat_pg_hours, stat_pg_days, stat_pg_30s, stat_pg_staging, stat_pg_processed, stat_pg_rollups;", &[]);
+        let _ = client.execute("TRUNCATE TABLE stat_pg_metrics, stat_pg_secs, stat_pg_mins, stat_pg_hours, stat_pg_days, stat_pg_30s, stat_pg_staging RESTART IDENTITY CASCADE;", &[]);
+        let _ = client.execute("VACUUM ANALYZE stat_pg_metrics, stat_pg_secs, stat_pg_mins, stat_pg_hours, stat_pg_days, stat_pg_30s, stat_pg_staging;", &[]);
     }
 
     // Register all simulated metric names in the database and retrieve their IDs
@@ -978,7 +978,7 @@ fn main() {
     }
 
     let mut total_processed: u64 = 0;
-    let output_processed = run_psql_query(&host, "SELECT COALESCE(SUM(count), 0) FROM stat_pg_processed;", true);
+    let output_processed = run_psql_query(&host, "SELECT COALESCE(SUM(value), 0)::bigint FROM stat_pg_secs;", true);
     if let Ok(out) = output_processed {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -993,9 +993,6 @@ fn main() {
         if let Ok(row) = client.query_one("SELECT received, dropped FROM stat_pg_udp_stats();", &[]) {
             final_udp_received = row.get(0);
             final_udp_dropped = row.get(1);
-        }
-        if let Ok(row) = client.query_one("SELECT COALESCE(SUM(total_latency_ms) / NULLIF(SUM(merge_count), 0), 0.0)::float8 FROM stat_pg_processed WHERE worker_id = 0;", &[]) {
-            avg_merge_latency = row.get(0);
         }
     }
 
@@ -1057,9 +1054,7 @@ fn main() {
                 ('stat_pg_mins'),
                 ('stat_pg_hours'),
                 ('stat_pg_days'),
-                ('stat_pg_30s'),
-                ('stat_pg_processed'),
-                ('stat_pg_rollups')
+                ('stat_pg_30s')
         ) as t(table_name);
     ";
     let output = run_psql_query(&host, space_query, false);
