@@ -985,6 +985,201 @@ extern "C" {
 }
 
 static EBPF_TOTAL_ITEMS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+static UDP_BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+static UDP_PACKET_COUNT: AtomicU64 = AtomicU64::new(0);
+static UDP_PARSE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static LOCK_WAIT_MICROS: AtomicU64 = AtomicU64::new(0);
+static EBPF_READ_MICROS: AtomicU64 = AtomicU64::new(0);
+static LAST_STAT_CPU: Mutex<(u64, u64)> = Mutex::new((0, 0));
+static LAST_NET_RX_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn get_system_cpu_times() -> (u64, u64) {
+    if let Ok(content) = std::fs::read_to_string("/proc/stat") {
+        if let Some(line) = content.lines().next() {
+            if line.starts_with("cpu ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 8 {
+                    let user: u64 = parts[1].parse().unwrap_or(0);
+                    let nice: u64 = parts[2].parse().unwrap_or(0);
+                    let system: u64 = parts[3].parse().unwrap_or(0);
+                    let idle: u64 = parts[4].parse().unwrap_or(0);
+                    let iowait: u64 = parts[5].parse().unwrap_or(0);
+                    let irq: u64 = parts[6].parse().unwrap_or(0);
+                    let softirq: u64 = parts[7].parse().unwrap_or(0);
+                    let steal: u64 = parts.get(8).and_then(|p| p.parse().ok()).unwrap_or(0);
+
+                    let idle_time = idle + iowait;
+                    let total_time = user + nice + system + idle + iowait + irq + softirq + steal;
+                    return (total_time, idle_time);
+                }
+            }
+        }
+    }
+    (0, 0)
+}
+
+fn get_process_ram_bytes() -> f64 {
+    if let Ok(content) = std::fs::read_to_string("/proc/self/status") {
+        for line in content.lines() {
+            if line.starts_with("VmRSS:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<f64>() {
+                        return kb * 1024.0;
+                    }
+                }
+            }
+        }
+    }
+    0.0
+}
+
+fn get_network_rx_bytes() -> u64 {
+    let mut total_rx = 0u64;
+    if let Ok(content) = std::fs::read_to_string("/proc/net/dev") {
+        for line in content.lines().skip(2) {
+            if let Some(colon_pos) = line.find(':') {
+                let rest = line[colon_pos + 1..].trim();
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if !parts.is_empty() {
+                    if let Ok(bytes) = parts[0].parse::<u64>() {
+                        total_rx += bytes;
+                    }
+                }
+            }
+        }
+    }
+    total_rx
+}
+
+fn get_udp_counters() -> (u64, u64) {
+    let mut rx = 0u64;
+    let mut drop = 0u64;
+    if let Ok(content) = std::fs::read_to_string("/proc/net/snmp") {
+        for line in content.lines() {
+            if line.starts_with("Udp:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 6 && parts[1] != "InDatagrams" {
+                    rx = parts[1].parse::<u64>().unwrap_or(0);
+                    drop = parts[5].parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+    }
+    (rx, drop)
+}
+
+fn flush_self_monitoring_and_profiling_metrics(
+    client: &mut SpiClient<'_>,
+    at: i64,
+    elapsed_sec: f64,
+    flush_duration_ms: f64,
+    flushed_rows_count: f64,
+    merge_duration_ms: f64,
+    merged_rows_count: f64,
+    rollup_min_ms: f64,
+    rollup_hour_ms: f64,
+    rollup_day_ms: f64,
+) -> Result<(), pgrx::spi::Error> {
+    let elapsed_sec = if elapsed_sec <= 0.0 { 1.0 } else { elapsed_sec };
+
+    let defined_metrics: f64 = client
+        .select("SELECT COUNT(*) FROM stat_pg_metrics;", None, &[])?
+        .first()
+        .get_one::<i64>()?
+        .unwrap_or(0) as f64;
+
+    let bg_workers = WORKERS.get() as f64;
+
+    let (curr_total, curr_idle) = get_system_cpu_times();
+    let mut cpu_pct = 0.0;
+    {
+        let mut last_cpu = LAST_STAT_CPU.lock().unwrap();
+        let (prev_total, prev_idle) = *last_cpu;
+        let delta_total = curr_total.saturating_sub(prev_total);
+        let delta_idle = curr_idle.saturating_sub(prev_idle);
+        if delta_total > 0 {
+            let delta_active = delta_total.saturating_sub(delta_idle);
+            cpu_pct = (delta_active as f64 / delta_total as f64) * 100.0;
+        }
+        *last_cpu = (curr_total, curr_idle);
+    }
+
+    let ram_bytes = get_process_ram_bytes();
+
+    let disk_bytes: f64 = client
+        .select("SELECT pg_database_size(current_database());", None, &[])?
+        .first()
+        .get_one::<i64>()?
+        .unwrap_or(0) as f64;
+
+    let curr_net_rx = get_network_rx_bytes();
+    let prev_net_rx = LAST_NET_RX_BYTES.swap(curr_net_rx, Ordering::Relaxed);
+    let net_bits_sec = if prev_net_rx > 0 && curr_net_rx >= prev_net_rx {
+        ((curr_net_rx - prev_net_rx) as f64 * 8.0) / elapsed_sec
+    } else {
+        0.0
+    };
+
+    let (udp_rx, udp_drop) = get_udp_counters();
+
+    let packet_count = UDP_PACKET_COUNT.swap(0, Ordering::Relaxed) as f64;
+    let batch_count = UDP_BATCH_COUNT.swap(0, Ordering::Relaxed) as f64;
+    let parse_errors = UDP_PARSE_ERRORS.swap(0, Ordering::Relaxed) as f64;
+    let lock_wait_us = LOCK_WAIT_MICROS.swap(0, Ordering::Relaxed) as f64;
+    let ebpf_read_us = EBPF_READ_MICROS.swap(0, Ordering::Relaxed) as f64;
+
+    let udp_packets_parsed_sec = packet_count / elapsed_sec;
+    let udp_batch_size_avg = if batch_count > 0.0 { packet_count / batch_count } else { 0.0 };
+
+    let metrics_to_record = [
+        ("stat_pg.defined_metrics", defined_metrics),
+        ("stat_pg.bg_workers", bg_workers),
+        ("stat_pg.cpu_consumed", cpu_pct),
+        ("stat_pg.ram_consumed", ram_bytes),
+        ("stat_pg.disk_space_consumed", disk_bytes),
+        ("stat_pg.network_bandwidth", net_bits_sec),
+        ("stat_pg.udp_received", udp_rx as f64),
+        ("stat_pg.udp_dropped", udp_drop as f64),
+        ("stat_pg.udp_packets_parsed_sec", udp_packets_parsed_sec),
+        ("stat_pg.udp_batch_size_avg", udp_batch_size_avg),
+        ("stat_pg.udp_parse_errors", parse_errors),
+        ("stat_pg.active_buffer_lock_wait_us", lock_wait_us),
+        ("stat_pg.flush_duration_ms", flush_duration_ms),
+        ("stat_pg.flushed_rows_count", flushed_rows_count),
+        ("stat_pg.merge_duration_ms", merge_duration_ms),
+        ("stat_pg.merged_rows_count", merged_rows_count),
+        ("stat_pg.rollup_minute_duration_ms", rollup_min_ms),
+        ("stat_pg.rollup_hour_duration_ms", rollup_hour_ms),
+        ("stat_pg.rollup_day_duration_ms", rollup_day_ms),
+        ("stat_pg.ebpf_read_duration_us", ebpf_read_us),
+    ];
+
+    let mut values_clause = Vec::new();
+    for (name, val) in metrics_to_record {
+        client.update(
+            &format!("INSERT INTO stat_pg_metrics (name, type) VALUES ('{}', 'numeric') ON CONFLICT (name) DO NOTHING;", name),
+            None, &[]
+        )?;
+        let id_opt: Option<i32> = client
+            .select(&format!("SELECT id FROM stat_pg_metrics WHERE name = '{}';", name), None, &[])?
+            .first()
+            .get_one::<i32>()?;
+        if let Some(id) = id_opt {
+            values_clause.push(format!("({}, {}, {})", id, at, val));
+        }
+    }
+
+    if !values_clause.is_empty() {
+        let insert_query = format!(
+            "INSERT INTO stat_pg_staging (metric_id, at, value) VALUES {};",
+            values_clause.join(",")
+        );
+        client.update(&insert_query, None, &[])?;
+    }
+
+    Ok(())
+}
 
 fn read_ebpf_map_metrics(flush_buf: &mut [f64]) {
     let path = match CString::new("/sys/fs/bpf/metrics_map") {
@@ -1225,7 +1420,19 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
             while running_thread.load(Ordering::Relaxed) {
                 match recv_batch_blocking(&socket, &mut bufs, &mut lengths) {
                     Ok(count) if count > 0 => {
-                        let mut active = active_buffer_clone.lock().unwrap();
+                        let mut active = match active_buffer_clone.try_lock() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                let t0 = SystemTime::now();
+                                let guard = active_buffer_clone.lock().unwrap();
+                                let wait = t0.elapsed().unwrap_or_default().as_micros() as u64;
+                                LOCK_WAIT_MICROS.fetch_add(wait, Ordering::Relaxed);
+                                guard
+                            }
+                        };
+                        UDP_BATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+                        UDP_PACKET_COUNT.fetch_add(count as u64, Ordering::Relaxed);
+
                         let max_id = max_valid_id_clone.load(Ordering::Relaxed) as usize;
                         let mut local_count = 0;
 
@@ -1238,6 +1445,8 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                         loop {
                             match recv_batch_nonblocking(&socket, &mut bufs, &mut lengths) {
                                 Ok(drain_count) if drain_count > 0 => {
+                                    UDP_BATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    UDP_PACKET_COUNT.fetch_add(drain_count as u64, Ordering::Relaxed);
                                     for i in 0..drain_count {
                                         local_count += parse_packet_payload(&bufs[i][..lengths[i]], max_id, &mut *active);
                                     }
@@ -1321,21 +1530,51 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     max_valid_id.store(db_max_id, Ordering::Relaxed);
 
                     // 2. Flush slot data
+                    let flushed_rows = local_flush_buffer.iter().filter(|&&v| v > 0.0).count() as f64;
+                    let t_flush = SystemTime::now();
                     flush_slot(client, at, &local_flush_buffer)?;
+                    let flush_ms = t_flush.elapsed().unwrap_or_default().as_secs_f64() * 1000.0;
+
+                    let mut rollup_min_ms = 0.0;
+                    let mut rollup_hour_ms = 0.0;
+                    let mut rollup_day_ms = 0.0;
 
                     // 3. Perform parallel pipeline database tasks
                     let num_workers = WORKERS.get() as usize;
-                    if worker_index == 0 {
-                        staging_merge(client)?;
-                    }
+
                     if worker_index == 1 % num_workers as i32 {
+                        let t_min = SystemTime::now();
                         rollup_minutes(client)?;
+                        rollup_min_ms = t_min.elapsed().unwrap_or_default().as_secs_f64() * 1000.0;
                     }
                     if worker_index == 2 % num_workers as i32 {
+                        let t_hour = SystemTime::now();
                         rollup_hours(client)?;
+                        rollup_hour_ms = t_hour.elapsed().unwrap_or_default().as_secs_f64() * 1000.0;
                     }
                     if worker_index == 3 % num_workers as i32 {
+                        let t_day = SystemTime::now();
                         rollup_days(client)?;
+                        rollup_day_ms = t_day.elapsed().unwrap_or_default().as_secs_f64() * 1000.0;
+                    }
+
+                    if worker_index == 0 {
+                        let t_merge = SystemTime::now();
+                        staging_merge(client)?;
+                        let merge_ms = t_merge.elapsed().unwrap_or_default().as_secs_f64() * 1000.0;
+
+                        let _ = flush_self_monitoring_and_profiling_metrics(
+                            client,
+                            at,
+                            elapsed.as_secs_f64(),
+                            flush_ms,
+                            flushed_rows,
+                            merge_ms,
+                            0.0,
+                            rollup_min_ms,
+                            rollup_hour_ms,
+                            rollup_day_ms,
+                        );
                     }
 
                     // 4. Update the total metrics processed count
@@ -1413,6 +1652,65 @@ fn stat_pg_udp_stats() -> TableIterator<'static, (name!(received, i64), name!(dr
     }
     let ebpf_items = EBPF_TOTAL_ITEMS_RECEIVED.load(Ordering::Relaxed) as i64;
     TableIterator::new(vec![(received, dropped, ebpf_items)].into_iter())
+}
+
+#[pg_extern]
+fn stat_pg_self_metrics() -> TableIterator<'static, (name!(metric_name, String), name!(value, f64), name!(unit, String))> {
+    let mut metrics = Vec::new();
+
+    let mut defined_count = 0.0;
+    if let Ok(res) = Spi::connect(|client| {
+        let cnt: Option<i64> = client.select("SELECT COUNT(*) FROM stat_pg_metrics;", None, &[])?.first().get_one()?;
+        Ok::<Option<i64>, pgrx::spi::Error>(cnt)
+    }) {
+        if let Some(c) = res {
+            defined_count = c as f64;
+        }
+    }
+    metrics.push(("stat_pg.defined_metrics".to_string(), defined_count, "count".to_string()));
+    metrics.push(("stat_pg.bg_workers".to_string(), WORKERS.get() as f64, "workers".to_string()));
+
+    let (total_cpu, idle_cpu) = get_system_cpu_times();
+    let cpu_pct = if total_cpu > 0 {
+        let active = total_cpu.saturating_sub(idle_cpu);
+        (active as f64 / total_cpu as f64) * 100.0
+    } else {
+        0.0
+    };
+    metrics.push(("stat_pg.cpu_consumed".to_string(), cpu_pct, "percent".to_string()));
+
+    let ram_bytes = get_process_ram_bytes();
+    metrics.push(("stat_pg.ram_consumed".to_string(), ram_bytes, "bytes".to_string()));
+
+    let mut db_bytes = 0.0;
+    if let Ok(res) = Spi::connect(|client| {
+        let sz: Option<i64> = client.select("SELECT pg_database_size(current_database());", None, &[])?.first().get_one()?;
+        Ok::<Option<i64>, pgrx::spi::Error>(sz)
+    }) {
+        if let Some(b) = res {
+            db_bytes = b as f64;
+        }
+    }
+    metrics.push(("stat_pg.disk_space_consumed".to_string(), db_bytes, "bytes".to_string()));
+
+    let (udp_rx, udp_drop) = get_udp_counters();
+    metrics.push(("stat_pg.udp_received".to_string(), udp_rx as f64, "packets".to_string()));
+    metrics.push(("stat_pg.udp_dropped".to_string(), udp_drop as f64, "packets".to_string()));
+
+    let packet_count = UDP_PACKET_COUNT.load(Ordering::Relaxed) as f64;
+    let batch_count = UDP_BATCH_COUNT.load(Ordering::Relaxed) as f64;
+    let parse_errors = UDP_PARSE_ERRORS.load(Ordering::Relaxed) as f64;
+    let lock_wait_us = LOCK_WAIT_MICROS.load(Ordering::Relaxed) as f64;
+    let ebpf_read_us = EBPF_READ_MICROS.load(Ordering::Relaxed) as f64;
+    let avg_batch = if batch_count > 0.0 { packet_count / batch_count } else { 0.0 };
+
+    metrics.push(("stat_pg.udp_packets_parsed_sec".to_string(), packet_count, "packets".to_string()));
+    metrics.push(("stat_pg.udp_batch_size_avg".to_string(), avg_batch, "packets/batch".to_string()));
+    metrics.push(("stat_pg.udp_parse_errors".to_string(), parse_errors, "errors".to_string()));
+    metrics.push(("stat_pg.active_buffer_lock_wait_us".to_string(), lock_wait_us, "microseconds".to_string()));
+    metrics.push(("stat_pg.ebpf_read_duration_us".to_string(), ebpf_read_us, "microseconds".to_string()));
+
+    TableIterator::new(metrics.into_iter())
 }
 
 #[pg_extern]
@@ -1684,6 +1982,56 @@ mod tests {
         assert_eq!(active[14], 9000000000000.0);
         assert_eq!(active[15], 12345.6789);
         assert_eq!(active[16], 12345.6789);
+    }
+
+    #[pg_test]
+    fn test_self_monitoring_metrics() {
+        Spi::connect_mut(|client| {
+            crate::flush_self_monitoring_and_profiling_metrics(
+                client,
+                1000,
+                1.0,
+                5.0,
+                10.0,
+                12.0,
+                20.0,
+                2.0,
+                1.0,
+                0.5,
+            ).expect("Self-monitoring flush failed");
+
+            let metric_count: i64 = client
+                .select("SELECT COUNT(*) FROM stat_pg_metrics WHERE name LIKE 'stat_pg.%';", None, &[])
+                .expect("Select failed")
+                .first()
+                .get_one::<i64>()
+                .expect("Failed to get count")
+                .expect("Expected count");
+
+            assert!(metric_count >= 15);
+
+            let staging_count: i64 = client
+                .select("SELECT COUNT(*) FROM stat_pg_staging;", None, &[])
+                .expect("Select staging failed")
+                .first()
+                .get_one::<i64>()
+                .expect("Failed to get count")
+                .expect("Expected staging count");
+
+            assert_eq!(staging_count, 20);
+
+            crate::staging_merge(client).expect("Merge failed");
+
+            let secs_count: i64 = client
+                .select("SELECT COUNT(*) FROM stat_pg_secs WHERE at = 1000;", None, &[])
+                .expect("Select secs failed")
+                .first()
+                .get_one::<i64>()
+                .expect("Failed to get count")
+                .expect("Expected secs count");
+
+            assert_eq!(secs_count, 20);
+        });
     }
 }
 
