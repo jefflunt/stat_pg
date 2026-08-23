@@ -116,6 +116,8 @@ fn print_help() {
          Options:\n  \
            --host <str>      Target host IP (default: 127.0.0.1)\n  \
            --port <u16>      Target port (default: 8125)\n  \
+           --db-port <u16>   Target PostgreSQL DB port (default: 5432 or 5433)\n  \
+           --db-name <str>   Target PostgreSQL DB name (default: postgres)\n  \
            --threads <u32>   Sender threads (default: CPU cores)\n  \
            --readers <u32>   Concurrent SQL reader threads (default: 0)\n  \
            --duration <u32>  Duration in seconds to run benchmark (default: 180)\n  \
@@ -241,6 +243,8 @@ fn main() {
     // Default configuration
     let mut host = "127.0.0.1".to_string();
     let mut port = 8125u16;
+    let mut db_port_opt: Option<u16> = None;
+    let mut db_name = "postgres".to_string();
     let mut threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let mut readers = 0u32;
     let mut duration_secs = 180u32;
@@ -257,6 +261,14 @@ fn main() {
             }
             "--port" if i + 1 < args.len() => {
                 port = args[i + 1].parse().expect("Invalid port number");
+                i += 2;
+            }
+            "--db-port" if i + 1 < args.len() => {
+                db_port_opt = Some(args[i + 1].parse().expect("Invalid db-port number"));
+                i += 2;
+            }
+            "--db-name" if i + 1 < args.len() => {
+                db_name = args[i + 1].clone();
                 i += 2;
             }
             "--threads" if i + 1 < args.len() => {
@@ -306,8 +318,10 @@ fn main() {
     let metrics_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let db_port = if host == "127.0.0.1" || host == "localhost" { 5433 } else { 5432 };
-    let db_url = format!("postgres://postgres:postgres@{}:{}/postgres", host, db_port);
+    let db_port = db_port_opt.unwrap_or_else(|| {
+        if host == "127.0.0.1" || host == "localhost" { 5433 } else { 5432 }
+    });
+    let db_url = format!("postgres://postgres:postgres@{}:{}/{}", host, db_port, db_name);
 
     // Spawn background SQL monitoring thread
     let host_clone = host.clone();
