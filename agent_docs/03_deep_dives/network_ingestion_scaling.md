@@ -25,7 +25,7 @@ Context switching between user space and kernel space to read/write individual p
 * Non-Linux systems fall back to standard `recv_from` calls.
 
 ### Client-Side (`sendmmsg`)
-* The benchmark client `stat-pg-bench` uses the `sendmmsg` system call on Linux to blast batches of `32` prebuilt packets (up to `3,840` metric updates) in a single system call.
+* The benchmark client `stat_pg_bench` uses the `sendmmsg` system call on Linux to blast batches of `32` prebuilt packets (up to `3,840` metric updates) in a single system call.
 * This drops benchmark CPU utilization and allows client systems to fully saturate the server's input capacity.
 
 ---

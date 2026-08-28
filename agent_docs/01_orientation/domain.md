@@ -81,4 +81,4 @@ Used for arbitrary high-precision float values.
 Multiple updates are packed contiguously into a single UDP packet up to the MTU safety limit of **`1,440` bytes** (approximately `120` updates of 12-byte equivalents, or up to `240` updates of 6-byte integer format).
 
 > [!WARNING]
-> The current `stat-pg-client` proxy daemon still formats UDP packets using the old `12-byte` TCP protocol format (4-byte ID + 8-byte value) and is incompatible with the updated UDP variable-length parser in the extension. The high-performance `stat-pg-bench` stress-test client implements the new 2-byte mixed payload format.
+> The current `stat_pg_client` proxy daemon still formats UDP packets using the old `12-byte` TCP protocol format (4-byte ID + 8-byte value) and is incompatible with the updated UDP variable-length parser in the extension. The high-performance `stat_pg_bench` stress-test client implements the new 2-byte mixed payload format.

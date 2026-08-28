@@ -84,8 +84,8 @@ fn flush_format_buffers<F>(
 
 fn print_help() {
     println!(
-        "stat-pg-client - StatsD-compatible UDP proxy daemon\n\n\
-        Usage: stat-pg-client [OPTIONS]\n\n\
+        "stat_pg_client - StatsD-compatible UDP proxy daemon\n\n\
+        Usage: stat_pg_client [OPTIONS]\n\n\
         Options:\n  \
           --listen <addr>   Address to listen for StatsD metrics (default: 127.0.0.1:8126)\n  \
           --server <addr>   Target stat-pg UDP server address (default: 127.0.0.1:8125)\n  \
@@ -205,7 +205,7 @@ fn main() {
     }
 
     println!("==================================================");
-    println!("stat-pg-client StatsD UDP Proxy Starting");
+    println!("stat_pg_client StatsD UDP Proxy Starting");
     println!("Listening for StatsD on  : {}", listen_addr);
     println!("Forwarding UDP server to : {}", server_addr);
     println!("Database metadata URL    : {}", db_url);

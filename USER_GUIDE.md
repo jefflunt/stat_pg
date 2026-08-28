@@ -21,7 +21,7 @@ Traditional time-series systems typically place a separate service (such as Prom
        │ (1. Optional StatsD Text lines)                         │ (2. High-speed Binary UDP)
        ▼                                                         │
 +-----------------------------+                                  │
-| stat-pg-client Proxy Daemon |                                  │
+| stat_pg_client Proxy Daemon |                                  │
 | - Ingests port 8126 (StatsD)|                                  │
 | - Registers Name -> ID      |                                  │
 | - Stuffs binary packets     |                                  │
@@ -153,13 +153,13 @@ stat_pg.flush_interval = 10.0        # Seconds between memory-to-database flush 
 
 You can send metrics to `stat-pg` using either of two methods:
 
-### Method A: StatsD Text Format via `stat-pg-client` Proxy (Port `8126`)
+### Method A: StatsD Text Format via `stat_pg_client` Proxy (Port `8126`)
 
 For existing applications utilizing standard StatsD client libraries (Python, Node.js, Go, Ruby, Java):
 
-1. Launch `stat-pg-client`:
+1. Launch `stat_pg_client`:
    ```bash
-   stat-pg-client --listen 127.0.0.1:8126 --server 127.0.0.1:8125 --db postgres://postgres:postgres@127.0.0.1:5432/postgres
+   stat_pg_client --listen 127.0.0.1:8126 --server 127.0.0.1:8125 --db postgres://postgres:postgres@127.0.0.1:5432/postgres
    ```
 2. Send standard StatsD lines over UDP to port `8126`:
    ```text
@@ -168,7 +168,7 @@ For existing applications utilizing standard StatsD client libraries (Python, No
    orders.revenue:199.99|curr
    system.cpu.load:72.5|g
    ```
-   `stat-pg-client` automatically registers unknown metric names in `stat_pg_metrics`, translates them to binary IDs, and batches updates to `stat-pg` on port `8125`.
+   `stat_pg_client` automatically registers unknown metric names in `stat_pg_metrics`, translates them to binary IDs, and batches updates to `stat-pg` on port `8125`.
 
 ### Method B: Native High-Performance Binary UDP Protocol (Port `8125`)
 
@@ -258,7 +258,7 @@ SELECT * FROM stat_pg_udp_stats();
 cargo build --release --manifest-path bench/Cargo.toml
 
 # Run benchmark
-./target/release/stat-pg-bench \
+./target/release/stat_pg_bench \
   --host 127.0.0.1 \
   --port 8125 \
   --db-port 5433 \

@@ -53,10 +53,10 @@ We will pack updates until the total size is as close to 1,440 bytes as possible
 ## Proposed Changes
 
 ### Database Extension
-#### [MODIFY] [src/lib.rs](file:///Users/jefflunt/code/stat-pg/src/lib.rs)
+#### [MODIFY] [src/lib.rs](file:///Users/jefflunt/code/stat_pg/src/lib.rs)
 - Refactor the first-batch and drain-loop parsing logic in `stat_pg_main_inner` to read 2-byte FFI IDs.
 
 ### Benchmark Tool
-#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat-pg/bench/src/main.rs)
+#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat_pg/bench/src/main.rs)
 - Refactor packet prebuilding to serialize 2-byte IDs (`i16`) and check remaining MTU capacity against 10 bytes.
 - Align loops and console display configurations to show 180 updates/batch averages.

@@ -1,6 +1,6 @@
 [package]
-name = "stat-pg-client"
-version = "0.3.0"
+name = "stat_pg_client"
+version = "0.4.1"
 edition = "2021"
 
 [dependencies]

@@ -50,6 +50,6 @@ To reduce the user-to-kernel boundary crossing overhead (system calls), we can b
 
 ### Benchmark Tool
 
-#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat-pg/bench/src/main.rs)
+#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat_pg/bench/src/main.rs)
 - Implement Phase 1 (prebuilt packet circular buffer).
 - Implement Phase 2 (`sendmmsg` batching on Linux).

@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    container_name: stat-pg-db
+    container_name: stat_pg_db
     command: ["postgres", "-c", "shared_preload_libraries=stat_pg", "-c", "stat_pg.workers=8", "-c", "max_worker_processes=16"]
     mem_limit: 64g
     privileged: true
@@ -23,7 +23,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    container_name: stat-pg-bench
+    container_name: stat_pg_bench
     volumes:
       - .:/workspace
       - cargo-cache:/root/.cargo/registry

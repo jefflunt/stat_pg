@@ -54,11 +54,11 @@ During packet prebuilding, we will randomize the format (50% chance for `INT32`,
 ## Proposed Changes
 
 ### Database Extension
-#### [MODIFY] [src/lib.rs](file:///Users/jefflunt/code/stat-pg/src/lib.rs)
+#### [MODIFY] [src/lib.rs](file:///Users/jefflunt/code/stat_pg/src/lib.rs)
 - Refactor the packet parsing loops in `stat_pg_main_inner` to decode both sign-extended `INT32` (8-byte) and `FLOAT64` (12-byte) formats.
 
 ### Benchmark Tool
-#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat-pg/bench/src/main.rs)
+#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat_pg/bench/src/main.rs)
 - Refactor packet prebuilding to randomly alternate format types.
 - Saturate packets to 1,440 bytes and track individual packet update counts.
 - Modify the sender loop to accumulate metrics using the packet-specific counts.

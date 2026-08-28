@@ -40,7 +40,7 @@ graph TD
 
 ### [stat-pg library]
 
-#### [MODIFY] [lib.rs](file:///Users/jefflunt/code/stat-pg/src/lib.rs)
+#### [MODIFY] [lib.rs](file:///Users/jefflunt/code/stat_pg/src/lib.rs)
 - Update `_PG_init` to register 4 background workers instead of 1.
 - Update `stat_pg_main` to set `socket.set_reuse_port(true)` using `socket2` before binding.
 

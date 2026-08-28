@@ -39,5 +39,5 @@ Linux supports `MSG_ZEROCOPY` for UDP sockets to avoid user-to-kernel copies.
 
 ### Benchmark Tool
 
-#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat-pg/bench/src/main.rs)
+#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat_pg/bench/src/main.rs)
 - Set socket send buffer size (`set_send_buffer_size`) to 50 MB on startup for all threads.

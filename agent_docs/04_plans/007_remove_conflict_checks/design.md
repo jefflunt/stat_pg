@@ -44,11 +44,11 @@ Retain the **8-worker process cluster** for maximum CPU parallelization.
 
 ### Database Extension
 
-#### [MODIFY] [lib.rs](file:///Users/jefflunt/code/stat-pg/src/lib.rs)
+#### [MODIFY] [lib.rs](file:///Users/jefflunt/code/stat_pg/src/lib.rs)
 * Implement CSV writer helper function `write_flush_csv(pid, entries, ts)`.
 * Implement the selected `COPY` execution logic inside `flush_slot`.
 
 ### Benchmark Tool
 
-#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat-pg/bench/src/main.rs)
+#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat_pg/bench/src/main.rs)
 * Add automatic `TRUNCATE ... CASCADE` and `VACUUM ANALYZE` to the startup block.

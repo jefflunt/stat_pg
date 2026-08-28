@@ -40,6 +40,6 @@ let value = f64::from_le_bytes(val_bytes.try_into().unwrap());
 
 ### Database Extension
 
-#### [MODIFY] [lib.rs](file:///Users/jefflunt/code/stat-pg/src/lib.rs)
+#### [MODIFY] [lib.rs](file:///Users/jefflunt/code/stat_pg/src/lib.rs)
 - Reimplement `recvmmsg_sys` using stack-allocated arrays of size 32.
 - Refactor the packet parsing logic in `stat_pg_main_inner` (both first batch and drain loop) to use pointer-based `read_unaligned`.

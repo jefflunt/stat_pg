@@ -15,6 +15,6 @@ We will increase the number of updates packed into each UDP packet from 100 to 1
 
 ### Benchmark Tool
 
-#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat-pg/bench/src/main.rs)
+#### [MODIFY] [bench/src/main.rs](file:///Users/jefflunt/code/stat_pg/bench/src/main.rs)
 - Update updates per packet from 100 to 120.
 - Update packet byte size constant from 1200 to 1440.

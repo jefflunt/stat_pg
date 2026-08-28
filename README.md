@@ -229,7 +229,7 @@ cargo build --release
 ### 2. Run the Benchmark
 Run the stress test against the local database container:
 ```bash
-./target/release/stat-pg-bench [options]
+./target/release/stat_pg_bench [options]
 ```
 
 **Options**:
@@ -241,13 +241,13 @@ Run the stress test against the local database container:
 
 **Example**:
 ```bash
-./target/release/stat-pg-bench --threads 4 --duration 5 --metrics 1000
+./target/release/stat_pg_bench --threads 4 --duration 5 --metrics 1000
 ```
 
 Console Output Example:
 ```text
 ==================================================
-stat-pg-bench Starting Bidirectional TCP Stress Test
+stat_pg_bench Starting Bidirectional TCP Stress Test
 Target Address : 127.0.0.1:8125
 Sender Threads : 4
 Run Duration   : 5 seconds (0.1 minutes)

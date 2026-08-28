@@ -51,5 +51,5 @@ We will append `ORDER BY` clauses matching the table primary keys to the `SELECT
 
 ### Database Extension
 
-#### [MODIFY] [lib.rs](file:///Users/jefflunt/code/stat-pg/src/lib.rs)
+#### [MODIFY] [lib.rs](file:///Users/jefflunt/code/stat_pg/src/lib.rs)
 - Modify the 5 SQL merge queries in `coordinator_merge` to add the sorting clauses.

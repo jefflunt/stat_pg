@@ -111,8 +111,8 @@ fn flush_format_buffers<F>(
 
 fn print_help() {
     println!(
-        "stat-pg-bench - High-speed TCP stress test benchmark tool\n\n\
-         Usage: stat-pg-bench [OPTIONS]\n\n\
+        "stat_pg_bench - High-speed TCP stress test benchmark tool\n\n\
+         Usage: stat_pg_bench [OPTIONS]\n\n\
          Options:\n  \
            --host <str>      Target host IP (default: 127.0.0.1)\n  \
            --port <u16>      Target port (default: 8125)\n  \
@@ -176,7 +176,7 @@ fn run_psql_query(host: &str, query: &str, select_only: bool) -> std::io::Result
         let args = if select_only {
             vec![
                 "exec",
-                "stat-pg-db",
+                "stat_pg_db",
                 "psql",
                 "-U",
                 "postgres",
@@ -189,7 +189,7 @@ fn run_psql_query(host: &str, query: &str, select_only: bool) -> std::io::Result
         } else {
             vec![
                 "exec",
-                "stat-pg-db",
+                "stat_pg_db",
                 "psql",
                 "-U",
                 "postgres",
@@ -300,7 +300,7 @@ fn main() {
 
     let target_addr = format!("{}:{}", host, port);
     println!("==================================================");
-    println!("stat-pg-bench Starting UDP Stress Test");
+    println!("stat_pg_bench Starting UDP Stress Test");
     println!("Target Address : {}", target_addr);
     println!("Sender Threads : {}", threads);
     if readers > 0 {

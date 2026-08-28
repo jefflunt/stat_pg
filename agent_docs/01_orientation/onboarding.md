@@ -1,6 +1,6 @@
 # Onboarding and Setup
 
-This document describes how to set up, compile, test, and run the `stat-pg` PostgreSQL extension and its benchmarking client.
+This document describes how to set up, compile, test, and run the `stat_pg` PostgreSQL extension and its benchmarking client.
 
 ---
 
@@ -62,7 +62,7 @@ cargo run --release --manifest-path bench/Cargo.toml -- --host 127.0.0.1 --port 
 - `--duration <u32>`: Duration of test in seconds.
 
 #### Benchmark Execution Flow
-When `stat-pg-bench` starts, it automatically:
+When `stat_pg_bench` starts, it automatically:
 1. Truncates all event and staging tables, and performs a database `VACUUM ANALYZE`.
 2. Registers simulated metric names (`bench.metric.[0-N]`) using an $O(N)$ bulk `generate_series` query (~50ms for 64,000 metrics).
 3. Warms up for `2.0` seconds to allow background workers to synchronize `max_valid_id` boundaries.
