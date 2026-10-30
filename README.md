@@ -1,8 +1,22 @@
 # stat-pg
 
+<p align="center">
+  <a href="https://statpg.com/">
+    <img src="https://statpg.com/assets/mascot-pulse-mecha.jpg" alt="stat_pg official mascot — The Pulse Mecha" width="380" />
+  </a>
+  <br />
+  <em>Meet <strong>Pulse Mecha</strong>, the official mascot of stat_pg.</em>
+</p>
+
+<p align="center">
+  🌐 <strong>Website:</strong> <a href="https://statpg.com/">https://statpg.com/</a>
+</p>
+
 A minimalist PostgreSQL extension for metric ingestion and aggregation.
 
 `stat-pg` runs a TCP socket listener directly inside the PostgreSQL database engine as a background worker process, aggregates metrics in-memory, and writes them to aggregate tables in periodic, transaction-safe batches. By doing this inside the database engine, millions of metrics per second can be aggregated while keeping the data queryable.
+
+Visit **[statpg.com](https://statpg.com/)** for architecture deep-dives, benchmarks, and the optimization story.
 
 ---
 
@@ -267,3 +281,12 @@ Throughput     : 280.10 MB/sec
 ==================================================
 ```
 This demonstrates blasting **14.3 million metrics/sec** over a **280 MB/sec** network throughput, with the database background worker successfully parsing, aggregating in-memory, and flushing directly inside PostgreSQL.
+
+---
+
+## Website & Resources
+
+Check out **[https://statpg.com/](https://statpg.com/)** for additional resources:
+- **[How It Works](https://statpg.com/how-it-works/)**: Complete architecture flow and wire protocol specifications.
+- **[The Optimization Journey](https://statpg.com/the-journey/)**: How the ingestion pipeline was optimized to 1.14+ billion metrics per second.
+- **Benchmark Disclosures**: Detailed test environment specs, eBPF XDP network bypass details, and storage efficiency metrics.
