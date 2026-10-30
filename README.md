@@ -5,7 +5,6 @@
     <img src="https://statpg.com/assets/mascot-pulse-mecha.jpg" alt="stat_pg official mascot — The Pulse Mecha" width="380" />
   </a>
   <br />
-  <em>Meet <strong>Pulse Mecha</strong>, the official mascot of stat_pg.</em>
 </p>
 
 <p align="center">
