@@ -73,7 +73,7 @@ Writing directly to target resolution tables under high load triggers high write
 * **Coordinator Merge**: Worker index `0` acts as the coordinator. In addition to staging its own data, it periodically:
   1. Creates a temporary table `stat_pg_temp` by selecting all rows from `stat_pg_staging`.
   2. Instantly runs `TRUNCATE stat_pg_staging` to release lock contention for other workers.
-  3. Inserts and aggregates metrics from `stat_pg_temp` into the final resolution tables (`stat_pg_secs`, `stat_pg_mins`, `stat_pg_hours`, `stat_pg_days`, `stat_pg_30s`).
+  3. Inserts and aggregates metrics from `stat_pg_temp` into the final resolution tables (`stat_pg_secs`, `stat_pg_mins`, `stat_pg_hours`, `stat_pg_days`, `stat_pg_30s`), according to which aggregation levels are enabled via GUCs (`stat_pg.aggregate_secs`, `stat_pg.aggregate_mins`, `stat_pg.aggregate_hours`, `stat_pg.aggregate_days`, `stat_pg.aggregate_30s`). Higher-level rollups dynamically fall back to the highest active underlying resolution or directly to `stat_pg_temp`.
   4. Drops `stat_pg_temp`.
 
 ### 5. B-Tree Sequential Insertion Optimization

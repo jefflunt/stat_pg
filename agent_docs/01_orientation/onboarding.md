@@ -85,6 +85,13 @@ stat_pg.port = 8125                  # UDP port to listen on
 stat_pg.flush_interval = 1.0         # Seconds interval to dump CSV and load to staging
 stat_pg.buffer_window = 5            # Aggregator sliding window size (unused in current UDP logic)
 stat_pg.workers = 4                  # Number of BGWorker processes to spawn (up to 16, default 4)
+
+# Aggregation levels (toggle individual resolutions on or off)
+stat_pg.aggregate_secs = on          # Aggregate per-second metrics (stat_pg_secs, default: on)
+stat_pg.aggregate_mins = on          # Aggregate per-minute metrics (stat_pg_mins, default: on)
+stat_pg.aggregate_hours = on         # Aggregate per-hour metrics (stat_pg_hours, default: on)
+stat_pg.aggregate_days = on          # Aggregate per-day metrics (stat_pg_days, default: on)
+stat_pg.aggregate_30s = on           # Aggregate 30-day metrics (stat_pg_30s, default: on)
 ```
 
 > [!NOTE]
