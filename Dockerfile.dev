@@ -33,7 +33,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/var/lib/postgresql/.cargo/bin:${PATH}"
 
 # Install cargo-pgrx
-RUN cargo install --locked cargo-pgrx
+RUN cargo install --locked cargo-pgrx --version 0.19.1
 
 # Initialize pgrx to point to Postgres 16 system install
 RUN cargo pgrx init --pg16=/usr/lib/postgresql/16/bin/pg_config
