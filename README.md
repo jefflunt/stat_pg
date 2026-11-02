@@ -161,6 +161,13 @@ stat_pg.bind_address = '0.0.0.0'     # The IP address to bind the TCP listener t
 stat_pg.port = 8125                  # The TCP port to listen on
 stat_pg.flush_interval = 1.0         # Interval in seconds to flush aggregated data to tables
 stat_pg.buffer_window = 5            # Sliding window size in seconds to buffer metrics (default: 5)
+
+# Aggregation levels (toggle individual resolutions on or off)
+stat_pg.aggregate_secs = on          # Aggregate per-second metrics (stat_pg_secs, default: on)
+stat_pg.aggregate_mins = on          # Aggregate per-minute metrics (stat_pg_mins, default: on)
+stat_pg.aggregate_hours = on         # Aggregate per-hour metrics (stat_pg_hours, default: on)
+stat_pg.aggregate_days = on          # Aggregate per-day metrics (stat_pg_days, default: on)
+stat_pg.aggregate_30s = on           # Aggregate 30-day metrics (stat_pg_30s, default: on)
 ```
 
 ### Can this be installed on an existing database?

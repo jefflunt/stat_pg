@@ -76,6 +76,11 @@ static FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new(10.0);
 static BUFFER_WINDOW: GucSetting<i32> = GucSetting::<i32>::new(5);
 static WORKERS: GucSetting<i32> = GucSetting::<i32>::new(4);
 static THREADS_PER_WORKER: GucSetting<i32> = GucSetting::<i32>::new(1);
+pub static AGGREGATE_SECS: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub static AGGREGATE_MINS: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub static AGGREGATE_HOURS: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub static AGGREGATE_DAYS: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub static AGGREGATE_30S: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -161,6 +166,51 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_bool_guc(
+        c"stat_pg.aggregate_secs",
+        c"Aggregate per-second metrics",
+        c"Whether stat_pg aggregates and persists metrics at the per-second resolution (stat_pg_secs).",
+        &AGGREGATE_SECS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"stat_pg.aggregate_mins",
+        c"Aggregate per-minute metrics",
+        c"Whether stat_pg aggregates and persists metrics at the per-minute resolution (stat_pg_mins).",
+        &AGGREGATE_MINS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"stat_pg.aggregate_hours",
+        c"Aggregate per-hour metrics",
+        c"Whether stat_pg aggregates and persists metrics at the per-hour resolution (stat_pg_hours).",
+        &AGGREGATE_HOURS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"stat_pg.aggregate_days",
+        c"Aggregate per-day metrics",
+        c"Whether stat_pg aggregates and persists metrics at the per-day resolution (stat_pg_days).",
+        &AGGREGATE_DAYS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"stat_pg.aggregate_30s",
+        c"Aggregate 30-day metrics",
+        c"Whether stat_pg aggregates and persists metrics at the 30-day resolution (stat_pg_30s).",
+        &AGGREGATE_30S,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     let num_workers = WORKERS.get();
     for i in 0..num_workers {
         BackgroundWorkerBuilder::new(&format!("stat_pg_aggregator_{}", i))
@@ -177,6 +227,10 @@ pub extern "C-unwind" fn _PG_init() {
 
 
 fn flush_slot(client: &mut SpiClient<'_>, ts: i64, data: &[f64]) -> Result<(), pgrx::spi::Error> {
+    if !AGGREGATE_SECS.get() && !AGGREGATE_MINS.get() && !AGGREGATE_HOURS.get() && !AGGREGATE_DAYS.get() && !AGGREGATE_30S.get() {
+        return Ok(());
+    }
+
     let mut active_entries = Vec::new();
     for (metric_id, &value) in data.iter().enumerate() {
         if value > 0.0 {
@@ -248,14 +302,54 @@ fn staging_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
     )?;
     client.update("TRUNCATE stat_pg_staging;", None, &[])?;
 
-    // 2. Merge into stat_pg_secs from temp table
-    client.update(
-        "INSERT INTO stat_pg_secs (metric_id, at, value)
-         SELECT metric_id, at, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at
-         ORDER BY at, metric_id
-         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_secs.value + EXCLUDED.value;",
-        None, &[]
-    )?;
+    let aggregate_secs = AGGREGATE_SECS.get();
+    let aggregate_mins = AGGREGATE_MINS.get();
+    let aggregate_hours = AGGREGATE_HOURS.get();
+    let aggregate_days = AGGREGATE_DAYS.get();
+    let aggregate_30s = AGGREGATE_30S.get();
+
+    // 2. Merge into the base active resolution
+    if aggregate_secs {
+        client.update(
+            "INSERT INTO stat_pg_secs (metric_id, at, value)
+             SELECT metric_id, at, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at
+             ORDER BY at, metric_id
+             ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_secs.value + EXCLUDED.value;",
+            None, &[]
+        )?;
+    } else if aggregate_mins {
+        client.update(
+            "INSERT INTO stat_pg_mins (metric_id, at, value)
+             SELECT metric_id, at / 60, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 60
+             ORDER BY at / 60, metric_id
+             ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_mins.value + EXCLUDED.value;",
+            None, &[]
+        )?;
+    } else if aggregate_hours {
+        client.update(
+            "INSERT INTO stat_pg_hours (metric_id, at, value)
+             SELECT metric_id, at / 3600, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 3600
+             ORDER BY at / 3600, metric_id
+             ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_hours.value + EXCLUDED.value;",
+            None, &[]
+        )?;
+    } else if aggregate_days {
+        client.update(
+            "INSERT INTO stat_pg_days (metric_id, at, value)
+             SELECT metric_id, at / 86400, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 86400
+             ORDER BY at / 86400, metric_id
+             ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;",
+            None, &[]
+        )?;
+    } else if aggregate_30s {
+        client.update(
+            "INSERT INTO stat_pg_30s (metric_id, at, value)
+             SELECT metric_id, at / 2592000, SUM(value) FROM stat_pg_temp GROUP BY metric_id, at / 2592000
+             ORDER BY at / 2592000, metric_id
+             ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;",
+            None, &[]
+        )?;
+    }
 
     // 3. Clean up temporary table
     client.update("DROP TABLE stat_pg_temp;", None, &[])?;
@@ -275,6 +369,10 @@ fn staging_merge(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
 }
 
 fn rollup_minutes(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
+    if !AGGREGATE_MINS.get() {
+        return Ok(());
+    }
+
     let current_sec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -289,19 +387,21 @@ fn rollup_minutes(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
             None, &[]
         )?;
     } else if current_min > last_min {
-        let start_at = last_min * 60;
-        let end_at = current_min * 60;
-        let query = format!(
-            "INSERT INTO stat_pg_mins (metric_id, at, value) \
-             SELECT metric_id, at / 60, SUM(value) \
-             FROM stat_pg_secs \
-             WHERE at >= {} AND at < {} \
-             GROUP BY metric_id, at / 60 \
-             ORDER BY at / 60, metric_id \
-             ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_mins.value + EXCLUDED.value;",
-            start_at, end_at
-        );
-        client.update(&query, None, &[])?;
+        if AGGREGATE_SECS.get() {
+            let start_at = last_min * 60;
+            let end_at = current_min * 60;
+            let query = format!(
+                "INSERT INTO stat_pg_mins (metric_id, at, value) \
+                 SELECT metric_id, at / 60, SUM(value) \
+                 FROM stat_pg_secs \
+                 WHERE at >= {} AND at < {} \
+                 GROUP BY metric_id, at / 60 \
+                 ORDER BY at / 60, metric_id \
+                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_mins.value + EXCLUDED.value;",
+                start_at, end_at
+            );
+            client.update(&query, None, &[])?;
+        }
         client.update(
             &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'minute';", current_min),
             None, &[]
@@ -311,6 +411,10 @@ fn rollup_minutes(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
 }
 
 fn rollup_hours(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
+    if !AGGREGATE_HOURS.get() {
+        return Ok(());
+    }
+
     let current_sec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -325,22 +429,44 @@ fn rollup_hours(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
             None, &[]
         )?;
     } else if current_hour > last_hour {
-        // Watermark Check: Minute rollup must have processed up to current_hour * 60
         let minute_watermark = get_rollup_val(client, "minute")?;
-        if minute_watermark >= current_hour * 60 {
-            let start_at = last_hour * 60;
-            let end_at = current_hour * 60;
-            let query = format!(
-                "INSERT INTO stat_pg_hours (metric_id, at, value) \
-                 SELECT metric_id, at / 60, SUM(value) \
-                 FROM stat_pg_mins \
-                 WHERE at >= {} AND at < {} \
-                 GROUP BY metric_id, at / 60 \
-                 ORDER BY at / 60, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_hours.value + EXCLUDED.value;",
-                start_at, end_at
-            );
-            client.update(&query, None, &[])?;
+        let watermark_ok = if AGGREGATE_MINS.get() {
+            minute_watermark >= current_hour * 60
+        } else {
+            true
+        };
+
+        if watermark_ok {
+            if AGGREGATE_MINS.get() {
+                let start_at = last_hour * 60;
+                let end_at = current_hour * 60;
+                let query = format!(
+                    "INSERT INTO stat_pg_hours (metric_id, at, value) \
+                     SELECT metric_id, at / 60, SUM(value) \
+                     FROM stat_pg_mins \
+                     WHERE at >= {} AND at < {} \
+                     GROUP BY metric_id, at / 60 \
+                     ORDER BY at / 60, metric_id \
+                     ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_hours.value + EXCLUDED.value;",
+                    start_at, end_at
+                );
+                client.update(&query, None, &[])?;
+            } else if AGGREGATE_SECS.get() {
+                let start_at = last_hour * 3600;
+                let end_at = current_hour * 3600;
+                let query = format!(
+                    "INSERT INTO stat_pg_hours (metric_id, at, value) \
+                     SELECT metric_id, at / 3600, SUM(value) \
+                     FROM stat_pg_secs \
+                     WHERE at >= {} AND at < {} \
+                     GROUP BY metric_id, at / 3600 \
+                     ORDER BY at / 3600, metric_id \
+                     ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_hours.value + EXCLUDED.value;",
+                    start_at, end_at
+                );
+                client.update(&query, None, &[])?;
+            }
+
             client.update(
                 &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'hour';", current_hour),
                 None, &[]
@@ -351,72 +477,169 @@ fn rollup_hours(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
 }
 
 fn rollup_days(client: &mut SpiClient<'_>) -> Result<(), pgrx::spi::Error> {
+    let aggregate_days = AGGREGATE_DAYS.get();
+    let aggregate_30s = AGGREGATE_30S.get();
+
+    if !aggregate_days && !aggregate_30s {
+        return Ok(());
+    }
+
     let current_sec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs() as i64;
 
-    let last_day = get_rollup_val(client, "day")?;
-    let current_day = current_sec / 86400;
+    if aggregate_days {
+        let last_day = get_rollup_val(client, "day")?;
+        let current_day = current_sec / 86400;
 
-    if last_day == 0 {
-        client.update(
-            &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('day', {}) ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_day),
-            None, &[]
-        )?;
-    } else if current_day > last_day {
-        // Watermark Check: Hour rollup must have processed up to current_day * 24
-        let hour_watermark = get_rollup_val(client, "hour")?;
-        if hour_watermark >= current_day * 24 {
-            let start_at = last_day * 24;
-            let end_at = current_day * 24;
-            let query = format!(
-                "INSERT INTO stat_pg_days (metric_id, at, value) \
-                 SELECT metric_id, at / 24, SUM(value) \
-                 FROM stat_pg_hours \
-                 WHERE at >= {} AND at < {} \
-                 GROUP BY metric_id, at / 24 \
-                 ORDER BY at / 24, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;",
-                start_at, end_at
-            );
-            client.update(&query, None, &[])?;
+        if last_day == 0 {
             client.update(
-                &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'day';", current_day),
+                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('day', {}) ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_day),
                 None, &[]
             )?;
+        } else if current_day > last_day {
+            let hour_watermark = get_rollup_val(client, "hour")?;
+            let watermark_ok = if AGGREGATE_HOURS.get() {
+                hour_watermark >= current_day * 24
+            } else {
+                true
+            };
+
+            if watermark_ok {
+                if AGGREGATE_HOURS.get() {
+                    let start_at = last_day * 24;
+                    let end_at = current_day * 24;
+                    let query = format!(
+                        "INSERT INTO stat_pg_days (metric_id, at, value) \
+                         SELECT metric_id, at / 24, SUM(value) \
+                         FROM stat_pg_hours \
+                         WHERE at >= {} AND at < {} \
+                         GROUP BY metric_id, at / 24 \
+                         ORDER BY at / 24, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;",
+                        start_at, end_at
+                    );
+                    client.update(&query, None, &[])?;
+                } else if AGGREGATE_MINS.get() {
+                    let start_at = last_day * 1440;
+                    let end_at = current_day * 1440;
+                    let query = format!(
+                        "INSERT INTO stat_pg_days (metric_id, at, value) \
+                         SELECT metric_id, at / 1440, SUM(value) \
+                         FROM stat_pg_mins \
+                         WHERE at >= {} AND at < {} \
+                         GROUP BY metric_id, at / 1440 \
+                         ORDER BY at / 1440, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;",
+                        start_at, end_at
+                    );
+                    client.update(&query, None, &[])?;
+                } else if AGGREGATE_SECS.get() {
+                    let start_at = last_day * 86400;
+                    let end_at = current_day * 86400;
+                    let query = format!(
+                        "INSERT INTO stat_pg_days (metric_id, at, value) \
+                         SELECT metric_id, at / 86400, SUM(value) \
+                         FROM stat_pg_secs \
+                         WHERE at >= {} AND at < {} \
+                         GROUP BY metric_id, at / 86400 \
+                         ORDER BY at / 86400, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;",
+                        start_at, end_at
+                    );
+                    client.update(&query, None, &[])?;
+                }
+
+                client.update(
+                    &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = 'day';", current_day),
+                    None, &[]
+                )?;
+            }
         }
     }
 
-    let last_30d = get_rollup_val(client, "30d")?;
-    let current_30d = current_sec / 2592000;
+    if aggregate_30s {
+        let last_30d = get_rollup_val(client, "30d")?;
+        let current_30d = current_sec / 2592000;
 
-    if last_30d == 0 {
-        client.update(
-            &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('30d', {}) ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_30d),
-            None, &[]
-        )?;
-    } else if current_30d > last_30d {
-        // Watermark Check: Day rollup must have processed up to current_30d * 30
-        let day_watermark = get_rollup_val(client, "day")?;
-        if day_watermark >= current_30d * 30 {
-            let start_at = last_30d * 30;
-            let end_at = current_30d * 30;
-            let query = format!(
-                "INSERT INTO stat_pg_30s (metric_id, at, value) \
-                 SELECT metric_id, at / 30, SUM(value) \
-                 FROM stat_pg_days \
-                 WHERE at >= {} AND at < {} \
-                 GROUP BY metric_id, at / 30 \
-                 ORDER BY at / 30, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;",
-                start_at, end_at
-            );
-            client.update(&query, None, &[])?;
+        if last_30d == 0 {
             client.update(
-                &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = '30d';", current_30d),
+                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('30d', {}) ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_30d),
                 None, &[]
             )?;
+        } else if current_30d > last_30d {
+            let day_watermark = get_rollup_val(client, "day")?;
+            let watermark_ok = if AGGREGATE_DAYS.get() {
+                day_watermark >= current_30d * 30
+            } else {
+                true
+            };
+
+            if watermark_ok {
+                if AGGREGATE_DAYS.get() {
+                    let start_at = last_30d * 30;
+                    let end_at = current_30d * 30;
+                    let query = format!(
+                        "INSERT INTO stat_pg_30s (metric_id, at, value) \
+                         SELECT metric_id, at / 30, SUM(value) \
+                         FROM stat_pg_days \
+                         WHERE at >= {} AND at < {} \
+                         GROUP BY metric_id, at / 30 \
+                         ORDER BY at / 30, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;",
+                        start_at, end_at
+                    );
+                    client.update(&query, None, &[])?;
+                } else if AGGREGATE_HOURS.get() {
+                    let start_at = last_30d * 720;
+                    let end_at = current_30d * 720;
+                    let query = format!(
+                        "INSERT INTO stat_pg_30s (metric_id, at, value) \
+                         SELECT metric_id, at / 720, SUM(value) \
+                         FROM stat_pg_hours \
+                         WHERE at >= {} AND at < {} \
+                         GROUP BY metric_id, at / 720 \
+                         ORDER BY at / 720, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;",
+                        start_at, end_at
+                    );
+                    client.update(&query, None, &[])?;
+                } else if AGGREGATE_MINS.get() {
+                    let start_at = last_30d * 43200;
+                    let end_at = current_30d * 43200;
+                    let query = format!(
+                        "INSERT INTO stat_pg_30s (metric_id, at, value) \
+                         SELECT metric_id, at / 43200, SUM(value) \
+                         FROM stat_pg_mins \
+                         WHERE at >= {} AND at < {} \
+                         GROUP BY metric_id, at / 43200 \
+                         ORDER BY at / 43200, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;",
+                        start_at, end_at
+                    );
+                    client.update(&query, None, &[])?;
+                } else if AGGREGATE_SECS.get() {
+                    let start_at = last_30d * 2592000;
+                    let end_at = current_30d * 2592000;
+                    let query = format!(
+                        "INSERT INTO stat_pg_30s (metric_id, at, value) \
+                         SELECT metric_id, at / 2592000, SUM(value) \
+                         FROM stat_pg_secs \
+                         WHERE at >= {} AND at < {} \
+                         GROUP BY metric_id, at / 2592000 \
+                         ORDER BY at / 2592000, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;",
+                        start_at, end_at
+                    );
+                    client.update(&query, None, &[])?;
+                }
+
+                client.update(
+                    &format!("UPDATE stat_pg_rollups SET last_aggregated_at = {} WHERE rollup_type = '30d';", current_30d),
+                    None, &[]
+                )?;
+            }
         }
     }
 
@@ -1542,17 +1765,17 @@ pub extern "C-unwind" fn stat_pg_main(_arg: pg_sys::Datum) {
                     // 3. Perform parallel pipeline database tasks
                     let num_workers = WORKERS.get() as usize;
 
-                    if worker_index == 1 % num_workers as i32 {
+                    if worker_index == 1 % num_workers as i32 && AGGREGATE_MINS.get() {
                         let t_min = SystemTime::now();
                         rollup_minutes(client)?;
                         rollup_min_ms = t_min.elapsed().unwrap_or_default().as_secs_f64() * 1000.0;
                     }
-                    if worker_index == 2 % num_workers as i32 {
+                    if worker_index == 2 % num_workers as i32 && AGGREGATE_HOURS.get() {
                         let t_hour = SystemTime::now();
                         rollup_hours(client)?;
                         rollup_hour_ms = t_hour.elapsed().unwrap_or_default().as_secs_f64() * 1000.0;
                     }
-                    if worker_index == 3 % num_workers as i32 {
+                    if worker_index == 3 % num_workers as i32 && (AGGREGATE_DAYS.get() || AGGREGATE_30S.get()) {
                         let t_day = SystemTime::now();
                         rollup_days(client)?;
                         rollup_day_ms = t_day.elapsed().unwrap_or_default().as_secs_f64() * 1000.0;
@@ -1716,87 +1939,238 @@ fn stat_pg_self_metrics() -> TableIterator<'static, (name!(metric_name, String),
 #[pg_extern]
 fn stat_pg_force_rollups() -> Result<(), pgrx::spi::Error> {
     Spi::connect_mut(|client| {
-        // 1. Truncate all rollup tables to prevent double-counting upon clean rebuild
-        client.update("TRUNCATE stat_pg_mins, stat_pg_hours, stat_pg_days, stat_pg_30s, stat_pg_rollups;", None, &[])?;
+        let aggregate_secs = AGGREGATE_SECS.get();
+        let aggregate_mins = AGGREGATE_MINS.get();
+        let aggregate_hours = AGGREGATE_HOURS.get();
+        let aggregate_days = AGGREGATE_DAYS.get();
+        let aggregate_30s = AGGREGATE_30S.get();
+
+        // 1. Truncate derived rollup tables (only tiers above the base active tier)
+        let mut tables_to_truncate = Vec::new();
+        if aggregate_secs && aggregate_mins {
+            tables_to_truncate.push("stat_pg_mins");
+        }
+        if (aggregate_secs || aggregate_mins) && aggregate_hours {
+            tables_to_truncate.push("stat_pg_hours");
+        }
+        if (aggregate_secs || aggregate_mins || aggregate_hours) && aggregate_days {
+            tables_to_truncate.push("stat_pg_days");
+        }
+        if (aggregate_secs || aggregate_mins || aggregate_hours || aggregate_days) && aggregate_30s {
+            tables_to_truncate.push("stat_pg_30s");
+        }
+        tables_to_truncate.push("stat_pg_rollups");
+
+        if !tables_to_truncate.is_empty() {
+            client.update(&format!("TRUNCATE {};", tables_to_truncate.join(", ")), None, &[])?;
+        }
 
         // 2. Force Minute Rollup from stat_pg_secs
-        let max_sec: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_secs;", None, &[])?.first().get_one()?;
-        if let Some(ms) = max_sec {
-            let current_min = ms / 60 + 1;
-            let query = format!(
-                "INSERT INTO stat_pg_mins (metric_id, at, value) \
-                 SELECT metric_id, at / 60, SUM(value) \
-                 FROM stat_pg_secs \
-                 GROUP BY metric_id, at / 60 \
-                 ORDER BY at / 60, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_mins.value + EXCLUDED.value;"
-            );
-            client.update(&query, None, &[])?;
-            client.update(
-                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('minute', {}) \
-                          ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_min),
-                None, &[]
-            )?;
+        if aggregate_mins && aggregate_secs {
+            let max_sec: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_secs;", None, &[])?.first().get_one()?;
+            if let Some(ms) = max_sec {
+                let current_min = ms / 60 + 1;
+                let query = format!(
+                    "INSERT INTO stat_pg_mins (metric_id, at, value) \
+                     SELECT metric_id, at / 60, SUM(value) \
+                     FROM stat_pg_secs \
+                     GROUP BY metric_id, at / 60 \
+                     ORDER BY at / 60, metric_id \
+                     ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_mins.value + EXCLUDED.value;"
+                );
+                client.update(&query, None, &[])?;
+                client.update(
+                    &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('minute', {}) \
+                              ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_min),
+                    None, &[]
+                )?;
+            }
         }
 
-        // 3. Force Hour Rollup from stat_pg_mins
-        let max_min: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_mins;", None, &[])?.first().get_one()?;
-        if let Some(mm) = max_min {
-            let current_hour = mm / 60 + 1;
-            let query = format!(
-                "INSERT INTO stat_pg_hours (metric_id, at, value) \
-                 SELECT metric_id, at / 60, SUM(value) \
-                 FROM stat_pg_mins \
-                 GROUP BY metric_id, at / 60 \
-                 ORDER BY at / 60, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_hours.value + EXCLUDED.value;"
-            );
-            client.update(&query, None, &[])?;
-            client.update(
-                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('hour', {}) \
-                          ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_hour),
-                None, &[]
-            )?;
+        // 3. Force Hour Rollup
+        if aggregate_hours {
+            if aggregate_mins {
+                let max_min: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_mins;", None, &[])?.first().get_one()?;
+                if let Some(mm) = max_min {
+                    let current_hour = mm / 60 + 1;
+                    let query = format!(
+                        "INSERT INTO stat_pg_hours (metric_id, at, value) \
+                         SELECT metric_id, at / 60, SUM(value) \
+                         FROM stat_pg_mins \
+                         GROUP BY metric_id, at / 60 \
+                         ORDER BY at / 60, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_hours.value + EXCLUDED.value;"
+                    );
+                    client.update(&query, None, &[])?;
+                    client.update(
+                        &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('hour', {}) \
+                                  ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_hour),
+                        None, &[]
+                    )?;
+                }
+            } else if aggregate_secs {
+                let max_sec: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_secs;", None, &[])?.first().get_one()?;
+                if let Some(ms) = max_sec {
+                    let current_hour = ms / 3600 + 1;
+                    let query = format!(
+                        "INSERT INTO stat_pg_hours (metric_id, at, value) \
+                         SELECT metric_id, at / 3600, SUM(value) \
+                         FROM stat_pg_secs \
+                         GROUP BY metric_id, at / 3600 \
+                         ORDER BY at / 3600, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_hours.value + EXCLUDED.value;"
+                    );
+                    client.update(&query, None, &[])?;
+                    client.update(
+                        &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('hour', {}) \
+                                  ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_hour),
+                        None, &[]
+                    )?;
+                }
+            }
         }
 
-        // 4. Force Day Rollup from stat_pg_hours
-        let max_hour: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_hours;", None, &[])?.first().get_one()?;
-        if let Some(mh) = max_hour {
-            let current_day = mh / 24 + 1;
-            let query = format!(
-                "INSERT INTO stat_pg_days (metric_id, at, value) \
-                 SELECT metric_id, at / 24, SUM(value) \
-                 FROM stat_pg_hours \
-                 GROUP BY metric_id, at / 24 \
-                 ORDER BY at / 24, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;"
-            );
-            client.update(&query, None, &[])?;
-            client.update(
-                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('day', {}) \
-                          ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_day),
-                None, &[]
-            )?;
+        // 4. Force Day Rollup
+        if aggregate_days {
+            if aggregate_hours {
+                let max_hour: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_hours;", None, &[])?.first().get_one()?;
+                if let Some(mh) = max_hour {
+                    let current_day = mh / 24 + 1;
+                    let query = format!(
+                        "INSERT INTO stat_pg_days (metric_id, at, value) \
+                         SELECT metric_id, at / 24, SUM(value) \
+                         FROM stat_pg_hours \
+                         GROUP BY metric_id, at / 24 \
+                         ORDER BY at / 24, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;"
+                    );
+                    client.update(&query, None, &[])?;
+                    client.update(
+                        &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('day', {}) \
+                                  ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_day),
+                        None, &[]
+                    )?;
+                }
+            } else if aggregate_mins {
+                let max_min: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_mins;", None, &[])?.first().get_one()?;
+                if let Some(mm) = max_min {
+                    let current_day = mm / 1440 + 1;
+                    let query = format!(
+                        "INSERT INTO stat_pg_days (metric_id, at, value) \
+                         SELECT metric_id, at / 1440, SUM(value) \
+                         FROM stat_pg_mins \
+                         GROUP BY metric_id, at / 1440 \
+                         ORDER BY at / 1440, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;"
+                    );
+                    client.update(&query, None, &[])?;
+                    client.update(
+                        &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('day', {}) \
+                                  ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_day),
+                        None, &[]
+                    )?;
+                }
+            } else if aggregate_secs {
+                let max_sec: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_secs;", None, &[])?.first().get_one()?;
+                if let Some(ms) = max_sec {
+                    let current_day = ms / 86400 + 1;
+                    let query = format!(
+                        "INSERT INTO stat_pg_days (metric_id, at, value) \
+                         SELECT metric_id, at / 86400, SUM(value) \
+                         FROM stat_pg_secs \
+                         GROUP BY metric_id, at / 86400 \
+                         ORDER BY at / 86400, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_days.value + EXCLUDED.value;"
+                    );
+                    client.update(&query, None, &[])?;
+                    client.update(
+                        &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('day', {}) \
+                                  ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_day),
+                        None, &[]
+                    )?;
+                }
+            }
         }
 
-        // 5. Force 30d Rollup from stat_pg_days
-        let max_day: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_days;", None, &[])?.first().get_one()?;
-        if let Some(md) = max_day {
-            let current_30d = md / 30 + 1;
-            let query = format!(
-                "INSERT INTO stat_pg_30s (metric_id, at, value) \
-                 SELECT metric_id, at / 30, SUM(value) \
-                 FROM stat_pg_days \
-                 GROUP BY metric_id, at / 30 \
-                 ORDER BY at / 30, metric_id \
-                 ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;"
-            );
-            client.update(&query, None, &[])?;
-            client.update(
-                &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('30d', {}) \
-                          ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_30d),
-                None, &[]
-            )?;
+        // 5. Force 30d Rollup
+        if aggregate_30s {
+            if aggregate_days {
+                let max_day: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_days;", None, &[])?.first().get_one()?;
+                if let Some(md) = max_day {
+                    let current_30d = md / 30 + 1;
+                    let query = format!(
+                        "INSERT INTO stat_pg_30s (metric_id, at, value) \
+                         SELECT metric_id, at / 30, SUM(value) \
+                         FROM stat_pg_days \
+                         GROUP BY metric_id, at / 30 \
+                         ORDER BY at / 30, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;"
+                    );
+                    client.update(&query, None, &[])?;
+                    client.update(
+                        &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('30d', {}) \
+                                  ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_30d),
+                        None, &[]
+                    )?;
+                }
+            } else if aggregate_hours {
+                let max_hour: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_hours;", None, &[])?.first().get_one()?;
+                if let Some(mh) = max_hour {
+                    let current_30d = mh / 720 + 1;
+                    let query = format!(
+                        "INSERT INTO stat_pg_30s (metric_id, at, value) \
+                         SELECT metric_id, at / 720, SUM(value) \
+                         FROM stat_pg_hours \
+                         GROUP BY metric_id, at / 720 \
+                         ORDER BY at / 720, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;"
+                    );
+                    client.update(&query, None, &[])?;
+                    client.update(
+                        &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('30d', {}) \
+                                  ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_30d),
+                        None, &[]
+                    )?;
+                }
+            } else if aggregate_mins {
+                let max_min: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_mins;", None, &[])?.first().get_one()?;
+                if let Some(mm) = max_min {
+                    let current_30d = mm / 43200 + 1;
+                    let query = format!(
+                        "INSERT INTO stat_pg_30s (metric_id, at, value) \
+                         SELECT metric_id, at / 43200, SUM(value) \
+                         FROM stat_pg_mins \
+                         GROUP BY metric_id, at / 43200 \
+                         ORDER BY at / 43200, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;"
+                    );
+                    client.update(&query, None, &[])?;
+                    client.update(
+                        &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('30d', {}) \
+                                  ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_30d),
+                        None, &[]
+                    )?;
+                }
+            } else if aggregate_secs {
+                let max_sec: Option<i64> = client.select("SELECT MAX(at) FROM stat_pg_secs;", None, &[])?.first().get_one()?;
+                if let Some(ms) = max_sec {
+                    let current_30d = ms / 2592000 + 1;
+                    let query = format!(
+                        "INSERT INTO stat_pg_30s (metric_id, at, value) \
+                         SELECT metric_id, at / 2592000, SUM(value) \
+                         FROM stat_pg_secs \
+                         GROUP BY metric_id, at / 2592000 \
+                         ORDER BY at / 2592000, metric_id \
+                         ON CONFLICT (at, metric_id) DO UPDATE SET value = stat_pg_30s.value + EXCLUDED.value;"
+                    );
+                    client.update(&query, None, &[])?;
+                    client.update(
+                        &format!("INSERT INTO stat_pg_rollups (rollup_type, last_aggregated_at) VALUES ('30d', {}) \
+                                  ON CONFLICT (rollup_type) DO UPDATE SET last_aggregated_at = EXCLUDED.last_aggregated_at;", current_30d),
+                        None, &[]
+                    )?;
+                }
+            }
         }
 
         Ok::<(), pgrx::spi::Error>(())
@@ -2031,6 +2405,217 @@ mod tests {
                 .expect("Expected secs count");
 
             assert_eq!(secs_count, 20);
+        });
+    }
+
+    #[pg_test]
+    fn test_skip_aggregate_secs() {
+        Spi::connect_mut(|client| {
+            client.update("SET stat_pg.aggregate_secs = off;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_mins = on;", None, &[]).unwrap();
+
+            client.update(
+                "INSERT INTO stat_pg_metrics (id, name) VALUES (10, 'metric_skip_secs') ON CONFLICT DO NOTHING;",
+                None, &[]
+            ).unwrap();
+
+            let mut data = vec![0.0; 11];
+            data[10] = 4.5;
+            crate::flush_slot(client, 1000, &data).expect("Flush slot failed");
+            crate::staging_merge(client).expect("Merge failed");
+
+            // Verify stat_pg_secs is skipped (0 rows)
+            let secs_count: i64 = client
+                .select("SELECT COUNT(*) FROM stat_pg_secs WHERE metric_id = 10;", None, &[])
+                .expect("Select secs failed")
+                .first()
+                .get_one::<i64>()
+                .expect("Failed to get count")
+                .expect("Expected secs count");
+            assert_eq!(secs_count, 0);
+
+            // Verify stat_pg_mins received the data directly
+            let min_val: f64 = client
+                .select("SELECT value::float8 FROM stat_pg_mins WHERE metric_id = 10 AND at = 1000 / 60;", None, &[])
+                .expect("Select mins failed")
+                .first()
+                .get_one::<f64>()
+                .expect("Failed to get val")
+                .expect("Expected mins value");
+            assert_eq!(min_val, 4.5);
+
+            // Additional merge (conflict update into mins)
+            data[10] = 5.5;
+            crate::flush_slot(client, 1000, &data).expect("Flush slot failed");
+            crate::staging_merge(client).expect("Merge failed");
+
+            let secs_count2: i64 = client
+                .select("SELECT COUNT(*) FROM stat_pg_secs WHERE metric_id = 10;", None, &[])
+                .expect("Select secs failed")
+                .first()
+                .get_one::<i64>()
+                .expect("Failed to get count")
+                .expect("Expected secs count");
+            assert_eq!(secs_count2, 0);
+
+            let min_val2: f64 = client
+                .select("SELECT value::float8 FROM stat_pg_mins WHERE metric_id = 10 AND at = 1000 / 60;", None, &[])
+                .expect("Select mins failed")
+                .first()
+                .get_one::<f64>()
+                .expect("Failed to get val")
+                .expect("Expected mins value");
+            assert_eq!(min_val2, 10.0);
+
+            // Reset GUCs
+            client.update("SET stat_pg.aggregate_secs = on;", None, &[]).unwrap();
+        });
+    }
+
+    #[pg_test]
+    fn test_skip_aggregate_secs_and_mins() {
+        Spi::connect_mut(|client| {
+            client.update("SET stat_pg.aggregate_secs = off;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_mins = off;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_hours = on;", None, &[]).unwrap();
+
+            client.update(
+                "INSERT INTO stat_pg_metrics (id, name) VALUES (11, 'metric_skip_secs_mins') ON CONFLICT DO NOTHING;",
+                None, &[]
+            ).unwrap();
+
+            let mut data = vec![0.0; 12];
+            data[11] = 8.0;
+            crate::flush_slot(client, 3600, &data).expect("Flush slot failed");
+            crate::staging_merge(client).expect("Merge failed");
+
+            // Verify secs and mins are skipped
+            let secs_count: i64 = client
+                .select("SELECT COUNT(*) FROM stat_pg_secs WHERE metric_id = 11;", None, &[])
+                .expect("Select secs failed")
+                .first()
+                .get_one::<i64>()
+                .expect("Failed to get count")
+                .expect("Expected secs count");
+            assert_eq!(secs_count, 0);
+
+            let mins_count: i64 = client
+                .select("SELECT COUNT(*) FROM stat_pg_mins WHERE metric_id = 11;", None, &[])
+                .expect("Select mins failed")
+                .first()
+                .get_one::<i64>()
+                .expect("Failed to get count")
+                .expect("Expected mins count");
+            assert_eq!(mins_count, 0);
+
+            // Verify hours received the data directly
+            let hour_val: f64 = client
+                .select("SELECT value::float8 FROM stat_pg_hours WHERE metric_id = 11 AND at = 3600 / 3600;", None, &[])
+                .expect("Select hours failed")
+                .first()
+                .get_one::<f64>()
+                .expect("Failed to get val")
+                .expect("Expected hours value");
+            assert_eq!(hour_val, 8.0);
+
+            // Reset GUCs
+            client.update("SET stat_pg.aggregate_secs = on;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_mins = on;", None, &[]).unwrap();
+        });
+    }
+
+    #[pg_test]
+    fn test_skip_all_aggregations() {
+        Spi::connect_mut(|client| {
+            client.update("SET stat_pg.aggregate_secs = off;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_mins = off;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_hours = off;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_days = off;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_30s = off;", None, &[]).unwrap();
+
+            client.update(
+                "INSERT INTO stat_pg_metrics (id, name) VALUES (12, 'metric_skip_all') ON CONFLICT DO NOTHING;",
+                None, &[]
+            ).unwrap();
+
+            let mut data = vec![0.0; 13];
+            data[12] = 12.0;
+            crate::flush_slot(client, 1000, &data).expect("Flush slot failed");
+            crate::staging_merge(client).expect("Merge failed");
+
+            // Verify none of the tables have data
+            let secs: i64 = client.select("SELECT COUNT(*) FROM stat_pg_secs WHERE metric_id = 12;", None, &[]).unwrap().first().get_one::<i64>().unwrap().unwrap();
+            let mins: i64 = client.select("SELECT COUNT(*) FROM stat_pg_mins WHERE metric_id = 12;", None, &[]).unwrap().first().get_one::<i64>().unwrap().unwrap();
+            let hours: i64 = client.select("SELECT COUNT(*) FROM stat_pg_hours WHERE metric_id = 12;", None, &[]).unwrap().first().get_one::<i64>().unwrap().unwrap();
+            let days: i64 = client.select("SELECT COUNT(*) FROM stat_pg_days WHERE metric_id = 12;", None, &[]).unwrap().first().get_one::<i64>().unwrap().unwrap();
+            let d30s: i64 = client.select("SELECT COUNT(*) FROM stat_pg_30s WHERE metric_id = 12;", None, &[]).unwrap().first().get_one::<i64>().unwrap().unwrap();
+
+            assert_eq!(secs, 0);
+            assert_eq!(mins, 0);
+            assert_eq!(hours, 0);
+            assert_eq!(days, 0);
+            assert_eq!(d30s, 0);
+
+            // Reset GUCs
+            client.update("SET stat_pg.aggregate_secs = on;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_mins = on;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_hours = on;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_days = on;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_30s = on;", None, &[]).unwrap();
+        });
+    }
+
+    #[pg_test]
+    fn test_force_rollups_with_skipped_levels() {
+        Spi::connect_mut(|client| {
+            client.update("SET stat_pg.aggregate_secs = off;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_mins = on;", None, &[]).unwrap();
+            client.update("SET stat_pg.aggregate_hours = on;", None, &[]).unwrap();
+
+            client.update(
+                "INSERT INTO stat_pg_metrics (id, name) VALUES (13, 'metric_force_skip') ON CONFLICT DO NOTHING;",
+                None, &[]
+            ).unwrap();
+
+            let mut data = vec![0.0; 14];
+            data[13] = 15.0;
+            crate::flush_slot(client, 7200, &data).expect("Flush slot failed");
+            crate::staging_merge(client).expect("Merge failed");
+
+            // mins is populated directly at 7200 / 60 = 120
+            let min_before: f64 = client
+                .select("SELECT value::float8 FROM stat_pg_mins WHERE metric_id = 13 AND at = 120;", None, &[])
+                .expect("Select mins failed")
+                .first()
+                .get_one::<f64>()
+                .expect("Failed to get val")
+                .expect("Expected mins value");
+            assert_eq!(min_before, 15.0);
+
+            // Force rollups
+            crate::stat_pg_force_rollups().expect("Force rollups failed");
+
+            // Verify mins is preserved and hours is populated from mins
+            let min_after: f64 = client
+                .select("SELECT value::float8 FROM stat_pg_mins WHERE metric_id = 13 AND at = 120;", None, &[])
+                .expect("Select mins failed")
+                .first()
+                .get_one::<f64>()
+                .expect("Failed to get val")
+                .expect("Expected mins value");
+            assert_eq!(min_after, 15.0);
+
+            let hour_after: f64 = client
+                .select("SELECT value::float8 FROM stat_pg_hours WHERE metric_id = 13 AND at = 120 / 60;", None, &[])
+                .expect("Select hours failed")
+                .first()
+                .get_one::<f64>()
+                .expect("Failed to get val")
+                .expect("Expected hours value");
+            assert_eq!(hour_after, 15.0);
+
+            // Reset GUCs
+            client.update("SET stat_pg.aggregate_secs = on;", None, &[]).unwrap();
         });
     }
 }
